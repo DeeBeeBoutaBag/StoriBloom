@@ -43,17 +43,3 @@ services:
           name: storibloom-api
           property: host # optional; you can paste manually later
 
-jobs:
-  - type: cron
-    name: storibloom-seed-once
-    schedule: "0 17 * * 1"  # example weekly; set to "ON_DEMAND" in dashboard if you prefer
-    env: node
-    plan: starter
-    region: oregon
-    buildCommand: npm i firebase-admin
-    startCommand: node scripts/seedFirestore.mjs
-    envVars:
-      - key: FIREBASE_PROJECT_ID
-        sync: false
-      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
-        sync: false
