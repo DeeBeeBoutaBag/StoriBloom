@@ -28,8 +28,6 @@ const TOTAL_BY_STAGE = {
   FINAL: 360,
 };
 
-VITE_API_URL="http://localhost:4000"
-
 export default function Room() {
   const { roomId } = useParams();
 
