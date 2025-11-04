@@ -1,0 +1,17 @@
+import React from 'react';
+import { motion } from 'framer-motion';
+
+export default function ChatMessage({ kind, who, text }) {
+  const isAsema = kind === 'asema';
+  return (
+    <motion.div
+      className={`msg ${isAsema ? 'asema' : 'user'}`}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: .18 }}
+    >
+      <div className="who">{isAsema ? '🤖' : who}</div>
+      <div className="bubble">{text}</div>
+    </motion.div>
+  );
+}

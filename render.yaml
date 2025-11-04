@@ -1,0 +1,59 @@
+services:
+  - type: web
+    name: storibloom-api
+    env: node
+    plan: starter
+    region: oregon
+    buildCommand: cd api && npm i
+    startCommand: cd api && node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: WEB_ORIGIN
+        # After the web service is created, copy its URL (https://storibloom-web.onrender.com) into here
+        fromService:
+          type: web
+          name: storibloom-web
+          property: host # optional; you can paste manually later
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
+        sync: false
+
+  - type: web
+    name: storibloom-web
+    env: node
+    plan: starter
+    region: oregon
+    buildCommand: cd web && npm i && npm run build
+    startCommand: cd web && npm run preview -- --host 0.0.0.0 --port 10000
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: VITE_API_URL
+        # After the API service is created, paste its URL (https://storibloom-api.onrender.com)
+        fromService:
+          type: web
+          name: storibloom-api
+          property: host # optional; you can paste manually later
+
+jobs:
+  - type: cron
+    name: storibloom-seed-once
+    schedule: "0 17 * * 1"  # example weekly; set to "ON_DEMAND" in dashboard if you prefer
+    env: node
+    plan: starter
+    region: oregon
+    buildCommand: npm i firebase-admin
+    startCommand: node scripts/seedFirestore.mjs
+    envVars:
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
+        sync: false

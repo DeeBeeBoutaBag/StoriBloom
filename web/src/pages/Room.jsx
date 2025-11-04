@@ -1,0 +1,530 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useParams } from 'react-router-dom';
+import { db, ensureAnon, bearer as bearerHeaders } from '../firebase';
+import {
+  doc,
+  setDoc,
+  onSnapshot,
+  collection,
+  addDoc,
+  query,
+  orderBy,
+  serverTimestamp,
+} from 'firebase/firestore';
+
+import TopBanner from '../components/TopBanner.jsx';
+import CountdownRing from '../components/CountdownRing.jsx';
+import ChatMessage from '../components/ChatMessage.jsx';
+import IdeaSidebar from '../components/IdeaSidebar.jsx';
+
+const ORDER = ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','ROUGH_DRAFT','EDITING','FINAL'];
+const TOTAL_BY_STAGE = {
+  LOBBY: 60,
+  DISCOVERY: 600,
+  IDEA_DUMP: 180,
+  PLANNING: 600,
+  ROUGH_DRAFT: 240,
+  EDITING: 600,
+  FINAL: 360,
+};
+
+VITE_API_URL="http://localhost:4000"
+
+export default function Room() {
+  const { roomId } = useParams();
+
+  // Role (read from login flow; default participant)
+  const role = useMemo(() => sessionStorage.getItem('role') || 'PARTICIPANT', []);
+  const isPresenter = role === 'PRESENTER';
+
+  // Room meta + stage state
+  const [stage, setStage] = useState('LOBBY');
+  const [stageEndsAt, setStageEndsAt] = useState(null);
+  const [roomMeta, setRoomMeta] = useState({ siteId: '', index: 1, inputLocked: false, topic: '' });
+
+  // Messages + sidebar
+  const [messages, setMessages] = useState([]);
+  const [ideaSummary, setIdeaSummary] = useState('');
+
+  // Compose state
+  const [text, setText] = useState('');
+  const [activePersona, setActivePersona] = useState(0);
+
+  // Personas from login
+  const personas = useMemo(() => {
+    try { return JSON.parse(sessionStorage.getItem('personas') || '["🙂"]'); }
+    catch { return ['🙂']; }
+  }, []);
+  const mode = sessionStorage.getItem('mode') || 'individual';
+
+  // Utilities
+  const scrollRef = useRef(null);
+  const [nowTick, setNowTick] = useState(Date.now());
+  const [sentWelcome, setSentWelcome] = useState(false);
+  const [askedRoughQs, setAskedRoughQs] = useState(false);
+
+  // --- Voting state (Discovery) ---
+  const [voteOpen, setVoteOpen] = useState(false);
+  const [voteOptions, setVoteOptions] = useState([]);      // [{num: 1, label: '…'}]
+  const [hasVoted, setHasVoted] = useState(false);
+  const [voteClosesAt, setVoteClosesAt] = useState(null);  // Date | null
+  const [voteCounts, setVoteCounts] = useState(null);      // optional aggregate
+  const [voteTopic, setVoteTopic] = useState('');          // selected topic (after close)
+  const votePollRef = useRef(null);
+
+  // Live countdown tick
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 500);
+    return () => clearInterval(t);
+  }, []);
+
+  // Subscribe to room doc + messages (all; filtered by stage in render)
+  useEffect(() => {
+    (async () => { await ensureAnon(); })();
+
+    const unsubRoom = onSnapshot(doc(db, 'rooms', roomId), (snap) => {
+      const d = snap.data();
+      if (!d) return;
+      setStage(d.stage || 'LOBBY');
+      setStageEndsAt(d.stageEndsAt?.toDate?.() || null);
+      setRoomMeta({
+        siteId: d.siteId || roomId.split('-')[0],
+        index: d.index || 1,
+        inputLocked: !!d.inputLocked,
+        topic: d.topic || '',
+      });
+      setIdeaSummary(d.ideaSummary || '');
+    });
+
+    const unsubMsgs = onSnapshot(
+      query(collection(db, `rooms/${roomId}/messages`), orderBy('createdAt', 'asc')),
+      (qs) => {
+        const arr = qs.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+        setMessages(arr);
+        requestAnimationFrame(() => {
+          const el = scrollRef.current;
+          if (el) el.scrollTop = el.scrollHeight;
+        });
+      }
+    );
+
+    return () => { unsubRoom(); unsubMsgs(); };
+  }, [roomId]);
+
+  // Presence (idempotent)
+  useEffect(() => {
+    (async () => {
+      const user = await ensureAnon();
+      const uid = user.uid;
+
+      const p0 = doc(db, `rooms/${roomId}/personas`, `${uid}-p0`);
+      await setDoc(p0, {
+        uid, emoji: personas[0], alias: personas[0], createdAt: serverTimestamp(),
+      }, { merge: true });
+
+      if (mode === 'pair' && personas[1]) {
+        const p1 = doc(db, `rooms/${roomId}/personas`, `${uid}-p1`);
+        await setDoc(p1, {
+          uid, emoji: personas[1], alias: personas[1], createdAt: serverTimestamp(),
+        }, { merge: true });
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Auto-greet when DISCOVERY begins (once)
+  useEffect(() => {
+    (async () => {
+      if (stage === 'DISCOVERY' && !sentWelcome) {
+        setSentWelcome(true);
+        try {
+          await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/welcome`, {
+            method: 'POST',
+            ...(await bearerHeaders()),
+          });
+        } catch { /* noop */ }
+      }
+    })();
+  }, [stage, sentWelcome, roomId]);
+
+  // ROUGH_DRAFT: have Asema ask 2–3 guiding questions once (after rough is generated by presenter or button)
+  useEffect(() => {
+    (async () => {
+      if (stage === 'ROUGH_DRAFT' && !askedRoughQs) {
+        setAskedRoughQs(true);
+        // We’ll let presenter or user click "Generate Rough" first; this hook stays to support auto assist Qs if server is configured so.
+        // No call here to avoid competing with your stricter “rough first, then ask” rule.
+      }
+    })();
+  }, [stage, askedRoughQs]);
+
+  // --- Voting: helpers ---
+  async function fetchVoteStatus() {
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/vote`, {
+        method: 'GET',
+        ...(await bearerHeaders()),
+      });
+      if (!res.ok) return;
+      const j = await res.json();
+      // shape: { votingOpen, options:[{num,label}], closesAt, hasVoted, counts?, topic? }
+      setVoteOpen(!!j.votingOpen && stage === 'DISCOVERY');
+      setVoteOptions(Array.isArray(j.options) ? j.options : []);
+      setHasVoted(!!j.hasVoted);
+      setVoteCounts(j.counts || null);
+      setVoteTopic(j.topic || '');
+      setVoteClosesAt(j.closesAt ? new Date(j.closesAt) : null);
+    } catch {
+      // ignore transient errors
+    }
+  }
+
+  async function startVote() {
+    try {
+      await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/vote/start`, {
+        method: 'POST',
+        ...(await bearerHeaders()),
+      });
+      await fetchVoteStatus();
+    } catch (e) {
+      alert('Could not start voting');
+    }
+  }
+
+  async function submitVote(choiceNum) {
+    try {
+      await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/vote/submit`, {
+        method: 'POST',
+        ...(await bearerHeaders()),
+        body: JSON.stringify({ choice: Number(choiceNum) }),
+      });
+      await fetchVoteStatus();
+    } catch (e) {
+      alert('Could not submit vote');
+    }
+  }
+
+  async function closeVote() {
+    try {
+      await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/vote/close`, {
+        method: 'POST',
+        ...(await bearerHeaders()),
+      });
+      await fetchVoteStatus();
+    } catch (e) {
+      alert('Could not close voting');
+    }
+  }
+
+  // Start polling vote status while in DISCOVERY
+  useEffect(() => {
+    if (stage !== 'DISCOVERY') {
+      if (votePollRef.current) {
+        clearInterval(votePollRef.current);
+        votePollRef.current = null;
+      }
+      setVoteOpen(false);
+      return;
+    }
+    // initial fetch
+    fetchVoteStatus();
+    votePollRef.current = setInterval(fetchVoteStatus, 2000);
+    return () => {
+      if (votePollRef.current) {
+        clearInterval(votePollRef.current);
+        votePollRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage, roomId]);
+
+  // Send message handler
+  async function send() {
+    const t = text.trim();
+    if (!t) return;
+
+    // respect input lock (e.g., after rough draft)
+    if (roomMeta.inputLocked && stage !== 'FINAL') return;
+
+    await addDoc(collection(db, `rooms/${roomId}/messages`), {
+      uid: (await ensureAnon()).uid,
+      personaIndex: activePersona,
+      authorType: 'user',
+      phase: stage,
+      text: t,
+      createdAt: serverTimestamp(),
+    });
+    setText('');
+
+    // If the user calls Asema by name → ask route (on-topic-only)
+    if (/(^|\s)asema[\s,!?]/i.test(t) || /^asema$/i.test(t)) {
+      try {
+        await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/ask`, {
+          method: 'POST',
+          ...(await bearerHeaders()),
+          body: JSON.stringify({ text: t }),
+        });
+      } catch { /* noop */ }
+    }
+
+    // During idea phases → trigger debounced summarizer (saves tokens)
+    if (stage === 'DISCOVERY' || stage === 'IDEA_DUMP') {
+      try {
+        await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/ideas/trigger`, {
+          method: 'POST',
+          ...(await bearerHeaders()),
+        });
+      } catch { /* noop */ }
+    }
+
+    // In FINAL: if someone types "done" or "submit", mark ready
+    if (stage === 'FINAL' && /^(done|submit)\b/i.test(t)) {
+      try {
+        await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/final/ready`, {
+          method: 'POST',
+          ...(await bearerHeaders()),
+        });
+      } catch { /* noop */ }
+    }
+  }
+
+  // Generate rough on click (visible during ROUGH_DRAFT)
+  async function generateRough() {
+    try {
+      // First request the draft (server ensures exactly 250 words)
+      await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/draft/generate`, {
+        method: 'POST',
+        ...(await bearerHeaders()),
+        body: JSON.stringify({ mode: 'draft' }),
+      });
+      // Then ask guiding questions (server should avoid duplicates)
+      await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/draft/generate`, {
+        method: 'POST',
+        ...(await bearerHeaders()),
+        body: JSON.stringify({ mode: 'ask' }),
+      });
+    } catch { /* noop */ }
+  }
+
+  // Start Final flow (Asema posts rough + instructions)
+  useEffect(() => {
+    (async () => {
+      if (stage === 'FINAL') {
+        try {
+          await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/final/start`, {
+            method: 'POST',
+            ...(await bearerHeaders()),
+          });
+        } catch { /* noop */ }
+      }
+    })();
+  }, [stage, roomId]);
+
+  // Presenter/manual finalize button
+  async function finalize() {
+    try {
+      await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/final/complete`, {
+        method: 'POST',
+        ...(await bearerHeaders()),
+      });
+    } catch { /* noop */ }
+  }
+
+  // Stage/time UI helpers
+  const total = TOTAL_BY_STAGE[stage] || 1;
+  const secsLeft = stageEndsAt ? Math.max(0, Math.floor((stageEndsAt.getTime() - nowTick) / 1000)) : 0;
+
+  // Input lock: allow typing in certain stages unless locked by API
+  const canType = !roomMeta.inputLocked && ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','EDITING','FINAL'].includes(stage);
+
+  return (
+    <>
+      <div className="heatmap-bg" />
+      <div className="scanlines" />
+      <div className="grain" />
+
+      <div className="room-wrap">
+        <TopBanner siteId={roomMeta.siteId} roomIndex={roomMeta.index} stage={stage} />
+
+        <div style={{ display: 'grid', gridTemplateColumns: (stage === 'DISCOVERY' || stage === 'IDEA_DUMP' || stage === 'PLANNING') ? '1fr 320px' : '1fr', gap: 14 }}>
+          {/* Chat card */}
+          <div className="chat">
+            {/* Header */}
+            <div className="chat-head">
+              <span className="stage-badge">{stage}</span>
+              <div className="ribbon" style={{ marginLeft: 10 }}>
+                {ORDER.map((s) => (
+                  <span key={s} className={s === stage ? 'on' : ''}>{s}</span>
+                ))}
+              </div>
+
+              <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
+                <CountdownRing secondsLeft={secsLeft} secondsTotal={total} />
+                <div className="persona-choices" title="Choose persona">
+                  {personas.map((p, i) => (
+                    <button
+                      key={i}
+                      className={i === activePersona ? 'active' : ''}
+                      onClick={() => setActivePersona(i)}
+                    >
+                      {p}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Messages (filtered to current stage = "clear chat" per phase) */}
+            <div ref={scrollRef} className="chat-body">
+              {messages
+                .filter((m) => (m.phase || 'LOBBY') === stage)
+                .map((m) => (
+                  <ChatMessage
+                    key={m.id}
+                    kind={m.authorType === 'asema' ? 'asema' : 'user'}
+                    who={m.authorType === 'asema' ? '🤖' : (personas[m.personaIndex] || personas[0])}
+                    text={m.text}
+                  />
+                ))}
+            </div>
+
+            {/* Input dock */}
+            <div className="chat-input">
+              <div className="persona-pill">
+                Speaking as <b style={{ fontSize: 16 }}>{personas[activePersona] || personas[0]}</b>
+              </div>
+
+              <div className="input-pill" style={{ opacity: canType ? 1 : .5 }}>
+                <input
+                  placeholder={canType ? 'Type your message… (say "Asema, ..." to ask her)' : 'Input locked in this phase'}
+                  value={text}
+                  onChange={(e) => setText(e.target.value)}
+                  onKeyDown={(e) => (e.key === 'Enter' && canType ? send() : null)}
+                  disabled={!canType}
+                />
+              </div>
+              <button className="btn primary" onClick={send} disabled={!canType}>Send</button>
+            </div>
+          </div>
+
+          {/* Idea Sidebar (visible in DISCOVERY / IDEA_DUMP / PLANNING) */}
+          {(stage === 'DISCOVERY' || stage === 'IDEA_DUMP' || stage === 'PLANNING') && (
+            <IdeaSidebar summary={ideaSummary} />
+          )}
+        </div>
+
+        {/* Stage-specific quick actions */}
+        <div className="row mt12" style={{ gap: 8, alignItems: 'center' }}>
+          {stage === 'DISCOVERY' && (
+            <>
+              {isPresenter ? (
+                <>
+                  <button className="btn" onClick={startVote}>Start Vote</button>
+                  <button className="btn" onClick={closeVote} disabled={!voteOpen}>Close Vote</button>
+                </>
+              ) : (
+                <button className="btn" onClick={() => setVoteOpen(true)} disabled={!voteOpen}>
+                  {voteOpen ? 'Vote Now' : 'Waiting for Vote'}
+                </button>
+              )}
+              <div className="hud-pill" style={{ marginLeft: 'auto' }}>
+                {roomMeta.topic ? `Topic: ${roomMeta.topic}` : (voteTopic ? `Topic: ${voteTopic}` : 'No topic selected')}
+              </div>
+            </>
+          )}
+
+          {stage === 'ROUGH_DRAFT' && (
+            <button className="btn" onClick={generateRough}>Generate Rough</button>
+          )}
+          {stage === 'FINAL' && (
+            <button className="btn primary" onClick={finalize}>Finalize</button>
+          )}
+          {/* Input lock indicator */}
+          {roomMeta.inputLocked && <div className="hud-pill" style={{ marginLeft: 'auto' }}>Input Locked</div>}
+        </div>
+      </div>
+
+      {/* --- Voting Modal (Discovery) --- */}
+      {stage === 'DISCOVERY' && voteOpen && (
+        <div
+          className="fixed inset-0 z-50"
+          style={{
+            background: 'rgba(0,0,0,0.55)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}
+          onClick={() => {}}
+        >
+          <div
+            className="rounded-2xl"
+            style={{
+              width: 520,
+              maxWidth: '92vw',
+              background: 'rgba(20,20,24,0.6)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              backdropFilter: 'blur(10px)',
+              boxShadow: '0 16px 48px rgba(0,0,0,0.45)',
+              color: 'white',
+              padding: 18
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+              <div className="gold-dot" />
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 18 }}>Vote for today’s topic</div>
+                <div style={{ opacity: .75, fontSize: 12 }}>
+                  Pick one number. Your vote is counted once. {voteClosesAt ? `Closes in ~${Math.max(0, Math.floor((voteClosesAt.getTime() - Date.now())/1000))}s` : ''}
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8, marginTop: 8 }}>
+              {(voteOptions.length ? voteOptions : [
+                { num: 1, label: 'Law Enforcement Profiling' },
+                { num: 2, label: 'Food Deserts' },
+                { num: 3, label: 'Red Lining' },
+                { num: 4, label: 'Homelessness' },
+                { num: 5, label: 'Wealth Gap' },
+              ]).map(opt => (
+                <button
+                  key={opt.num}
+                  className="btn"
+                  disabled={hasVoted}
+                  onClick={() => submitVote(opt.num)}
+                  style={{ display: 'flex', justifyContent: 'space-between' }}
+                >
+                  <span><b>{opt.num}.</b> {opt.label}</span>
+                  {hasVoted && voteCounts && typeof voteCounts[opt.num] === 'number' && (
+                    <span className="hud-pill">{voteCounts[opt.num]} votes</span>
+                  )}
+                </button>
+              ))}
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 12 }}>
+              <div style={{ fontSize: 12, opacity: .75 }}>
+                {hasVoted ? 'You have voted.' : 'You have not voted yet.'}
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                {!isPresenter && (
+                  <button className="btn" onClick={() => setVoteOpen(false)}>Close</button>
+                )}
+                {isPresenter && (
+                  <button className="btn primary" onClick={closeVote}>Close & Lock Topic</button>
+                )}
+              </div>
+            </div>
+
+            {(voteTopic || roomMeta.topic) && (
+              <div className="hud-pill" style={{ marginTop: 10 }}>
+                Selected Topic: <b>{roomMeta.topic || voteTopic}</b>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
