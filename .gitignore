@@ -2,3 +2,9 @@
 *.env
 api/.env
 web/.env
+.env
+*.env
+api/.env
+web/.env
+node_modules/
+**/node_modules/
