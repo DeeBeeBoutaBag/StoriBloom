@@ -1,5 +1,14 @@
 {
+  "name": "storibloom-scripts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "seed:dynamo": "node scripts/seedDynamo.mjs",
+    "dump:dynamo": "node scripts/dumpDynamo.mjs"
+  },
   "dependencies": {
-    "firebase-admin": "^13.5.0"
+    "@aws-sdk/client-dynamodb": "^3.922.0",
+    "@aws-sdk/lib-dynamodb": "^3.922.0",
+    "yargs": "^17.7.2"
   }
 }
