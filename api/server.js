@@ -83,6 +83,7 @@ app.post('/auth/guest', (req, res) => {
   }
 });
 
+
 // Optional middleware
 if (compression) app.use(compression());
 if (morgan) app.use(morgan('tiny'));
