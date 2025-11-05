@@ -1,7 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { motion, useMotionValue, useTransform } from 'framer-motion';
 import EmojiDrawer from '../components/EmojiDrawer.jsx';
-import { ensureAnon, bearer as bearerHeaders } from '../firebase';
+import { ensureGuest, bearer as bearerHeaders, API_BASE } from '../api';
 
 export default function Login() {
   const [code, setCode] = useState('');
@@ -10,6 +10,7 @@ export default function Login() {
   const [emoji2, setEmoji2] = useState('🦊');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [activePicker, setActivePicker] = useState(1);
+  const [busy, setBusy] = useState(false);
   const cardRef = useRef(null);
 
   // 3D tilt with framer-motion
@@ -29,27 +30,45 @@ export default function Login() {
   function onMouseLeave() { x.set(0); y.set(0); }
 
   async function submit() {
+    const trimmed = code.trim();
+    if (!trimmed) { alert('Please enter your session code.'); return; }
+
     try {
-      await ensureAnon();
-      const res = await fetch(import.meta.env.VITE_API_URL + '/codes/consume', {
+      setBusy(true);
+
+      // Ensure we have a guest JWT from the API (stored by ensureGuest)
+      await ensureGuest();
+
+      // Consume code at AWS API
+      const res = await fetch(`${API_BASE}/codes/consume`, {
         method: 'POST',
         ...(await bearerHeaders()),
-        body: JSON.stringify({ code: code.trim() }),
+        body: JSON.stringify({ code: trimmed }),
       });
-      const json = await res.json();
-      if (!res.ok) { alert(json.error || 'Login failed'); return; }
 
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(json.error || 'Login failed. Check your code and try again.');
+        setBusy(false);
+        return;
+      }
+
+      // Presenter or Participant route
       if (json.role === 'PRESENTER') {
-        location.href = `/presenter/${json.siteId}`;
+        // Presenter goes to HUD (they’ll input siteId there)
+        location.href = `/presenter`;
       } else {
         const personas = mode === 'pair' ? [emoji1, emoji2] : [emoji1];
         sessionStorage.setItem('personas', JSON.stringify(personas));
         sessionStorage.setItem('mode', mode);
+        // For demo we route to room 1 of the site; server can later assign
         location.href = `/room/${json.siteId}-1`;
       }
     } catch (e) {
-      alert('Could not reach server. Check API URL.');
       console.error(e);
+      alert('Could not reach API. Check your API_BASE and CORS.');
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -86,6 +105,7 @@ export default function Login() {
               value={code}
               onChange={(e)=>setCode(e.target.value)}
               onKeyDown={(e)=> (e.key==='Enter') && submit()}
+              disabled={busy}
             />
           </div>
 
@@ -95,11 +115,13 @@ export default function Login() {
               className={`btn ${mode==='individual'?'':'ghost'}`}
               onClick={()=>setMode('individual')}
               title="One person per device"
+              disabled={busy}
             >Individual</button>
             <button
               className={`btn ${mode==='pair'?'':'ghost'}`}
               onClick={()=>setMode('pair')}
               title="Two personas on this device"
+              disabled={busy}
             >Pair</button>
             <div style={{ marginLeft: 'auto', fontSize: 12, color: '#9aa0a6' }}>
               You’ll appear anonymous, identified by your emoji.
@@ -114,6 +136,7 @@ export default function Login() {
                 className="chip tilt-raise-sm"
                 onClick={()=>{ setActivePicker(1); setDrawerOpen(true); }}
                 aria-label="Choose first emoji"
+                disabled={busy}
               >{emoji1}</button>
 
               {mode==='pair' && (
@@ -121,10 +144,15 @@ export default function Login() {
                   className="chip tilt-raise-sm"
                   onClick={()=>{ setActivePicker(2); setDrawerOpen(true); }}
                   aria-label="Choose second emoji"
+                  disabled={busy}
                 >{emoji2}</button>
               )}
 
-              <button className="btn ghost" onClick={()=>{ setActivePicker(1); setDrawerOpen(true); }}>
+              <button
+                className="btn ghost"
+                onClick={()=>{ setActivePicker(1); setDrawerOpen(true); }}
+                disabled={busy}
+              >
                 Open emoji drawer
               </button>
             </div>
@@ -132,7 +160,9 @@ export default function Login() {
 
           {/* Action row */}
           <div className="row mt24">
-            <button className="btn primary tilt-raise" onClick={submit}>Enter StoriBloom</button>
+            <button className="btn primary tilt-raise" onClick={submit} disabled={busy}>
+              {busy ? 'Entering…' : 'Enter StoriBloom'}
+            </button>
             <div style={{ marginLeft: 'auto', fontSize: 12, color: '#b9bec6' }}>
               Tip: press <span style={{ color: 'var(--gold)' }}>Enter</span> to submit.
             </div>
