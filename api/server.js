@@ -1,78 +1,404 @@
 // /opt/StoriBloom/api/server.js
+// ESM, Node 20+
+//
+// Env required (example .env):
+// PORT=4000
+// WEB_ORIGIN=http://ec2-54-187-77-195.us-west-2.compute.amazonaws.com:4000
+// AWS_REGION=us-west-2
+// OPENAI_API_KEY=sk-...
+//
+// DynamoDB tables expected (as created earlier):
+// - storibloom_codes          (PK: code;      attrs: siteId, role, consumed, usedByUid, consumedAt)
+// - storibloom_rooms          (PK: id;        attrs: siteId, index, stage, stageEndsAt, inputLocked, ideaSummary, memoryNotes, votingOpen, votingOptions, votesReceived, voteCounts, finalDoneUids, submittedFinal, finalAwaiting, topic)
+// - storibloom_messages       (PK: roomId, SK: createdAt numeric epoch ms; attrs: authorType, personaIndex, phase, text, uid)
+// - storibloom_drafts         (PK: roomId, SK: createdAt numeric; attrs: version, content)
+// - storibloom_submissions    (PK: id;        attrs: roomId, siteId, finalText, createdAt)
+
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import compression from 'compression';
+import helmet from 'helmet';
 import morgan from 'morgan';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { OpenAI } from 'openai';
 
+// ---------- OpenAI ----------
+import OpenAI from 'openai';
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ---------- AWS SDK (DynamoDB v3) ----------
 import {
   DynamoDBClient,
   GetItemCommand,
   PutItemCommand,
   UpdateItemCommand,
   QueryCommand,
+  ScanCommand,
 } from '@aws-sdk/client-dynamodb';
-import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 
-/* ------------------------- ENV + GLOBALS ------------------------- */
-const {
-  PORT = 4000,
-  NODE_ENV = 'production',
-  AWS_REGION = 'us-west-2',
-  OPENAI_API_KEY,
-} = process.env;
+const REGION = process.env.AWS_REGION || 'us-west-2';
+const ddb = new DynamoDBClient({ region: REGION });
 
-const TABLES = {
-  codes: 'storibloom_codes',
-  rooms: 'storibloom_rooms',
-  messages: 'storibloom_messages',
-  drafts: 'storibloom_drafts',
-  submissions: 'storibloom_submissions',
-};
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SPA_DIR = '/opt/StoriBloom/web-dist';
-
+// ---------- App ----------
 const app = express();
-const db = new DynamoDBClient({ region: AWS_REGION });
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const PORT = Number(process.env.PORT || 4000);
+const WEB_ORIGIN =
+  process.env.WEB_ORIGIN ||
+  'http://ec2-54-187-77-195.us-west-2.compute.amazonaws.com:4000';
 
-/* ------------------------- MIDDLEWARE ---------------------------- */
+// ---------- Security / CORS / Parsers ----------
+app.disable('x-powered-by');
 app.use(
-  cors({
-    origin: [
-      'http://localhost:5173',
-      `http://localhost:${PORT}`,
-      // same-origin (served by this Express) will be fine without CORS anyway
-    ],
-    credentials: false,
+  helmet({
+    crossOriginResourcePolicy: false,
   })
 );
+
+// CORS for your full URL (and for local dev)
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Allow same-origin (no Origin header) and your configured web origin
+      if (!origin) return cb(null, true);
+      if (origin === WEB_ORIGIN || origin === 'http://localhost:5173') {
+        return cb(null, true);
+      }
+      // You can relax this to always true, but this is safer:
+      return cb(null, false);
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id'],
+    credentials: true,
+  })
+);
+app.options('*', cors());
+
+app.use(compression());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
-/* ------------------------- LIGHT AUTH ---------------------------- */
-/** Demo-only auth: accepts any Bearer <uid>, falls back to x-demo-uid header. */
-async function requireAuth(req, res, next) {
+// ---------- Utils ----------
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function nowMs() {
+  return Date.now();
+}
+function asNum(n, fallback = 0) {
+  const v = Number(n);
+  return Number.isFinite(v) ? v : fallback;
+}
+
+// Required header: x-user-id
+function requireUser(req, res, next) {
+  const uid = req.headers['x-user-id'];
+  if (!uid || typeof uid !== 'string') {
+    return res.status(401).json({ error: 'Missing x-user-id' });
+  }
+  req.userId = uid;
+  next();
+}
+
+// Dynamo helpers
+async function ddbGet(table, key) {
+  const cmd = new GetItemCommand({ TableName: table, Key: key });
+  const out = await ddb.send(cmd);
+  return out.Item || null;
+}
+
+async function ddbPut(table, item) {
+  const cmd = new PutItemCommand({ TableName: table, Item: item });
+  await ddb.send(cmd);
+}
+
+async function ddbUpdate(params) {
+  const cmd = new UpdateItemCommand(params);
+  return ddb.send(cmd);
+}
+
+async function ddbQuery(params) {
+  const cmd = new QueryCommand(params);
+  const out = await ddb.send(cmd);
+  return out.Items || [];
+}
+
+async function ddbScan(params) {
+  const cmd = new ScanCommand(params);
+  const out = await ddb.send(cmd);
+  return out.Items || [];
+}
+
+// Marshalling helpers
+const S = (v) => ({ S: String(v) });
+const N = (v) => ({ N: String(v) });
+const BOOL = (v) => ({ BOOL: !!v });
+const Ls = (arr) => ({ L: (arr || []).map((x) => S(x)) });
+const Ln = (arr) => ({ L: (arr || []).map((x) => N(x)) });
+
+// ---------- Static hosting (serve built SPA) ----------
+const WEB_DIST = path.resolve('/opt/StoriBloom/web-dist');
+app.get('/', async (_req, res, next) => {
+  // If index.html exists, serve SPA; otherwise fallback to API health text
   try {
-    const hdr = req.headers.authorization || '';
-    let uid = null;
-    if (hdr.startsWith('Bearer ') && hdr.length > 7) uid = hdr.slice(7).trim();
-    if (!uid) uid = req.headers['x-demo-uid'];
-    if (!uid) return res.status(401).json({ error: 'Missing Authorization Bearer <uid>' });
-    req.user = { uid };
-    return next();
+    res.sendFile(path.join(WEB_DIST, 'index.html'));
   } catch (e) {
-    console.error('Auth error', e);
-    return res.status(401).json({ error: 'Invalid auth' });
+    next();
+  }
+});
+app.use(express.static(WEB_DIST, { extensions: ['html'] }));
+
+// ---------- Health ----------
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    time: new Date().toISOString(),
+    region: REGION,
+  });
+});
+
+// ---------- Codes: consume (LOGIN) ----------
+app.post('/codes/consume', requireUser, async (req, res) => {
+  try {
+    const code = String(req.body?.code || '').trim();
+    if (!code) return res.status(400).json({ error: 'Missing code' });
+
+    // Codes table is keyed by code
+    const item = await ddbGet('storibloom_codes', { code: S(code) });
+    if (!item) return res.status(404).json({ error: 'Code not found or invalid' });
+
+    const consumed = item.consumed?.BOOL;
+    if (consumed) return res.status(400).json({ error: 'Code already used' });
+
+    // Mark consumed
+    await ddbUpdate({
+      TableName: 'storibloom_codes',
+      Key: { code: S(code) },
+      UpdateExpression: 'SET consumed = :c, usedByUid = :u, consumedAt = :t',
+      ExpressionAttributeValues: {
+        ':c': BOOL(true),
+        ':u': S(req.userId),
+        ':t': N(nowMs()),
+      },
+    });
+
+    const siteId = item.siteId?.S || 'W1';
+    const role = item.role?.S || 'PARTICIPANT';
+    return res.json({ siteId, role });
+  } catch (e) {
+    console.error('consume error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---------- Room helpers ----------
+async function getRoom(roomId) {
+  const item = await ddbGet('storibloom_rooms', { id: S(roomId) });
+  if (!item) return null;
+
+  const parseListS = (L) => (L?.L || []).map((x) => x.S).filter(Boolean);
+  const parseListN = (L) => (L?.L || []).map((x) => Number(x.N)).filter((n) => Number.isFinite(n));
+
+  return {
+    id: item.id.S,
+    siteId: item.siteId?.S,
+    index: asNum(item.index?.N, 1),
+    stage: item.stage?.S || 'LOBBY',
+    stageEndsAt: asNum(item.stageEndsAt?.N, 0),
+    inputLocked: !!item.inputLocked?.BOOL,
+    ideaSummary: item.ideaSummary?.S || '',
+    memoryNotes: parseListS(item.memoryNotes),
+    // Voting
+    votingOpen: !!item.votingOpen?.BOOL,
+    votingOptions: parseListS(item.votingOptions),
+    votesReceived: asNum(item.votesReceived?.N, 0),
+    voteCounts: parseListN(item.voteCounts),
+    topic: item.topic?.S || '',
+    // Final
+    finalAwaiting: !!item.finalAwaiting?.BOOL,
+    finalDoneUids: parseListS(item.finalDoneUids),
+    submittedFinal: !!item.submittedFinal?.BOOL,
+  };
+}
+
+async function updateRoom(roomId, fields) {
+  // Build UpdateExpression dynamically
+  const names = {};
+  const values = {};
+  const sets = [];
+
+  const put = (name, value) => {
+    const key = `#${name}`;
+    const val = `:${name}`;
+    names[key] = name;
+
+    if (typeof value === 'string') values[val] = S(value);
+    else if (typeof value === 'number') values[val] = N(value);
+    else if (typeof value === 'boolean') values[val] = BOOL(value);
+    else if (Array.isArray(value)) {
+      if (value.length && typeof value[0] === 'number') values[val] = Ln(value);
+      else values[val] = Ls(value);
+    } else if (value == null) values[val] = S(''); // simple null-strategy
+    sets.push(`${key} = ${val}`);
+  };
+
+  Object.entries(fields).forEach(([k, v]) => put(k, v));
+
+  if (!sets.length) return;
+
+  await ddbUpdate({
+    TableName: 'storibloom_rooms',
+    Key: { id: S(roomId) },
+    UpdateExpression: 'SET ' + sets.join(', '),
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values,
+  });
+}
+
+async function putMessage(roomId, msg) {
+  const ts = nowMs();
+  await ddbPut('storibloom_messages', {
+    roomId: S(roomId),
+    createdAt: N(ts),
+    uid: msg.uid ? S(msg.uid) : S(''),
+    personaIndex: N(msg.personaIndex ?? -1),
+    authorType: S(msg.authorType || 'user'),
+    phase: S(msg.phase || 'LOBBY'),
+    text: S(msg.text || ''),
+  });
+}
+
+async function getStageMessages(roomId, stage) {
+  // Query by PK roomId, then filter client-side by phase
+  const items = await ddbQuery({
+    TableName: 'storibloom_messages',
+    KeyConditionExpression: 'roomId = :r',
+    ExpressionAttributeValues: { ':r': S(roomId) },
+  });
+  return items
+    .map((it) => ({
+      roomId: it.roomId.S,
+      createdAt: asNum(it.createdAt.N),
+      authorType: it.authorType?.S || 'user',
+      phase: it.phase?.S || 'LOBBY',
+      personaIndex: asNum(it.personaIndex?.N, -1),
+      text: it.text?.S || '',
+      uid: it.uid?.S || '',
+    }))
+    .filter((m) => (m.phase || 'LOBBY') === stage)
+    .sort((a, b) => a.createdAt - b.createdAt);
+}
+
+async function postAsema(roomId, stage, text) {
+  await putMessage(roomId, {
+    uid: '',
+    personaIndex: -1,
+    authorType: 'asema',
+    phase: stage,
+    text,
+  });
+}
+
+// ---------- Persona + greetings ----------
+function greetScript(topic) {
+  const t = topic ? ` Today’s topic is **${topic}**.` : '';
+  return `🎉 Hey y’all! I’m **Asema**, your host. We’ll move in timed stages—keep your ideas tight and on-topic.${t} When ready, say *“Asema, we are ready to vote”* to propose topics or move on.`;
+}
+
+function personaSystemPrompt(roomTopic) {
+  return `You are **Asema**, a modern, warm, 30-year-old Black woman hosting a creative game-show style session. 
+Speak concise, clear, and encouraging. Stay **strictly on the session topic** (${roomTopic || 'the chosen topic'}) and the current stage. 
+If asked off-topic, politely decline and redirect to the activity. Keep responses natural and specific—no generic filler.`;
+}
+
+// ---------- Debouncer (for idea summary) ----------
+class DebounceWorker {
+  constructor({ runFn, delayMs = 10_000, maxWaitMs = 30_000 }) {
+    this.runFn = runFn;
+    this.delayMs = delayMs;
+    this.maxWaitMs = maxWaitMs;
+    this.timers = new Map();
+  }
+  trigger(key) {
+    const prev = this.timers.get(key);
+    const now = Date.now();
+    if (prev) {
+      clearTimeout(prev.timer);
+      if (now - prev.first >= this.maxWaitMs) {
+        this._run(key);
+        return;
+      }
+      const timer = setTimeout(() => this._run(key), this.delayMs);
+      this.timers.set(key, { first: prev.first, timer });
+    } else {
+      const timer = setTimeout(() => this._run(key), this.delayMs);
+      this.timers.set(key, { first: now, timer });
+    }
+  }
+  async _run(key) {
+    const meta = this.timers.get(key);
+    if (!meta) return;
+    clearTimeout(meta.timer);
+    this.timers.delete(key);
+    try {
+      await this.runFn(key);
+    } catch (e) {
+      console.error('[DebounceWorker] runFn error for', key, e);
+    }
   }
 }
 
-/* ------------------------- UTILS ---------------------------- */
-const ORDER = ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','ROUGH_DRAFT','EDITING','FINAL'];
-const DUR = { // seconds
+const ideaDebouncer = new DebounceWorker({
+  runFn: summarizeIdeasForRoom,
+  delayMs: 10_000,
+  maxWaitMs: 30_000,
+});
+
+// ---------- Idea summarizer (LLM) ----------
+async function summarizeIdeasForRoom(roomId) {
+  const room = await getRoom(roomId);
+  if (!room) return;
+
+  const stage = room.stage;
+  if (stage !== 'DISCOVERY' && stage !== 'IDEA_DUMP') return;
+
+  const msgs = await getStageMessages(roomId, stage);
+  const human = msgs
+    .filter((m) => m.authorType === 'user')
+    .map((m) => `- ${m.text}`)
+    .join('\n');
+
+  const system = personaSystemPrompt(room.topic || room.siteId || 'topic');
+  const prompt =
+    `Summarize the key ideas so far as ultra-tight bullet points (themes, characters, conflicts, settings, constraints). Keep it concrete.\n\n${human}`;
+
+  const r = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.4,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: prompt },
+    ],
+    max_tokens: 260,
+  });
+
+  const summary = r.choices?.[0]?.message?.content?.trim() || '- (no ideas captured yet)';
+  const uniqueNotes = Array.from(
+    new Set([
+      ...(room.memoryNotes || []),
+      ...summary
+        .split('\n')
+        .map((s) => s.replace(/^[-•]\s?/, '').trim())
+        .filter(Boolean),
+    ])
+  );
+
+  await updateRoom(roomId, { ideaSummary: summary, memoryNotes: uniqueNotes });
+  await postAsema(roomId, stage, `Here’s a quick snapshot of our ideas so far:\n${summary}`);
+}
+
+// ---------- Stage helpers ----------
+const ORDER = ['LOBBY', 'DISCOVERY', 'IDEA_DUMP', 'PLANNING', 'ROUGH_DRAFT', 'EDITING', 'FINAL'];
+const TOTAL_BY_STAGE = {
   LOBBY: 60,
   DISCOVERY: 600,
   IDEA_DUMP: 180,
@@ -82,204 +408,80 @@ const DUR = { // seconds
   FINAL: 360,
 };
 
-function nowMs() { return Date.now(); }
-function stageIndex(stage) { return Math.max(0, ORDER.indexOf(stage || 'LOBBY')); }
-function clampStage(i) { return ORDER[Math.min(Math.max(i, 0), ORDER.length-1)]; }
-
-async function getRoom(roomId) {
-  const out = await db.send(new GetItemCommand({
-    TableName: TABLES.rooms,
-    Key: marshall({ roomId }),
-  }));
-  if (!out.Item) return null;
-  return unmarshall(out.Item);
-}
-
-async function putRoom(room) {
-  await db.send(new PutItemCommand({
-    TableName: TABLES.rooms,
-    Item: marshall(room),
-  }));
-}
-
-async function setRoomProps(roomId, patch) {
+async function setStage(roomId, to) {
+  // Special tokens: 'NEXT' / 'REDO' or actual stage strings
   const room = await getRoom(roomId);
-  const updated = { ...(room || { roomId, stage: 'LOBBY' }), ...patch };
-  await putRoom(updated);
-  return updated;
-}
+  if (!room) return;
 
-async function postMessage({ roomId, authorType, phase, uid = null, personaIndex = -1, text }) {
-  const createdAt = Date.now();
-  await db.send(new PutItemCommand({
-    TableName: TABLES.messages,
-    Item: marshall({ roomId, createdAt, phase, authorType, uid, personaIndex, text }),
-  }));
-  return { roomId, createdAt, phase, authorType, uid, personaIndex, text };
-}
-
-async function listStageMessages(roomId, phase) {
-  // Query by roomId and filter by phase via GSI "byRoomPhase" OR do client filter from main index
-  // We’ll do client filter using the main range on createdAt to keep indexes minimal:
-  const q = await db.send(new QueryCommand({
-    TableName: TABLES.messages,
-    KeyConditionExpression: 'roomId = :r',
-    ExpressionAttributeValues: marshall({ ':r': roomId }),
-    ScanIndexForward: true,
-  }));
-  const all = (q.Items || []).map(unmarshall);
-  return all.filter(m => (m.phase || 'LOBBY') === phase);
-}
-
-function toWords(text) {
-  return text
-    .replace(/\s+/g, ' ')
-    .trim()
-    .split(' ')
-    .filter(Boolean);
-}
-function force250Words(text) {
-  const words = toWords(text);
-  if (words.length === 250) return text.trim();
-  if (words.length < 250) {
-    // pad gently by reflecting a sentence
-    const pad = words.slice(Math.max(0, words.length - Math.min(words.length, 20)));
-    while (words.length < 250) words.push(...pad);
-    return words.slice(0, 250).join(' ').trim();
+  let nextStage = to;
+  if (to === 'NEXT') {
+    const idx = Math.max(0, ORDER.indexOf(room.stage));
+    nextStage = ORDER[Math.min(ORDER.length - 1, idx + 1)];
+  } else if (to === 'REDO') {
+    nextStage = 'ROUGH_DRAFT';
   }
-  return words.slice(0, 250).join(' ').trim();
+  const ends = nowMs() + 1000 * (TOTAL_BY_STAGE[nextStage] || 120);
+  await updateRoom(roomId, {
+    stage: nextStage,
+    stageEndsAt: ends,
+    inputLocked: false,
+  });
+
+  // stage greeting
+  const greet = stageGreeting(nextStage, room.topic);
+  await postAsema(roomId, nextStage, greet);
+
+  // clear chat is handled client side by filtering messages by phase
 }
 
-/* ------------------------- DEBOUNCER ---------------------------- */
-const debounceMap = new Map(); // roomId -> { timer, lastRunAt }
-function scheduleDebounced(roomId, fn, delayMs = 10_000, maxWaitMs = 30_000) {
-  const now = nowMs();
-  const entry = debounceMap.get(roomId) || { timer: null, startAt: now, lastRunAt: 0 };
-  const shouldMaxFlush = (now - entry.startAt) >= maxWaitMs;
-
-  clearTimeout(entry.timer);
-  const run = async () => {
-    try { await fn(); } catch (e) { console.error('[Debounce] run error', e); }
-    debounceMap.delete(roomId);
-  };
-
-  if (shouldMaxFlush) {
-    run();
-  } else {
-    entry.timer = setTimeout(run, delayMs);
-    debounceMap.set(roomId, entry);
+function stageGreeting(stage, topic) {
+  const t = topic ? ` Our topic: **${topic}**.` : '';
+  switch (stage) {
+    case 'DISCOVERY':
+      return `Welcome to DISCOVERY!${t} Share quick brainstorm notes. When you’re ready, say: “Asema, we are ready to vote.”`;
+    case 'IDEA_DUMP':
+      return `IDEA DUMP time — rapid-fire points only. I’ll keep a sidebar of key ideas.`;
+    case 'PLANNING':
+      return `PLANNING — outline essential beats or constraints. Keep it punchy.`;
+    case 'ROUGH_DRAFT':
+      return `ROUGH DRAFT — I’ll post a 250-word draft from your ideas; then we can refine.`;
+    case 'EDITING':
+      return `EDITING — propose precise changes: wording, tone, clarity.`;
+    case 'FINAL':
+      return `FINAL — I’ll start with the rough draft. Make edits; say “done” when ready to submit.`;
+    default:
+      return `We’re in ${stage}. Keep it focused and short.`;
   }
 }
 
-/* ------------------------- OPENAI PERSONA ---------------------------- */
-const ISSUES = [
-  'Law Enforcement Profiling',
-  'Food Deserts',
-  'Red Lining',
-  'Homelessness',
-  'Wealth Gap'
-];
-function personaSystemPrompt(roomTopic) {
-  return [
-    `You are Asema — a lively, 30-year-old African American game-show-style host and expert facilitator.`,
-    `You help a group collaboratively craft a concise, vivid 250-word abstract about "${roomTopic || 'a selected community issue'}".`,
-    `Constraints: stay on-session, on-topic, natural tone; be specific; avoid generic filler; give helpful structure.`,
-    `If asked about unrelated topics, decline and gently steer back to the activity.`,
-  ].join('\n');
-}
-function greetScript(roomTopic) {
-  return [
-    `🎤 Asema here — welcome team! Today we’ll co-create a tight, punchy 250-word abstract on "${roomTopic || 'one community issue'}".`,
-    `We’ll warm up, gather ideas, shape a plan, build a rough draft, then polish a final.`,
-    `If you need me anytime, just say "Asema, ..." and I’ll jump in.`,
-    `Let’s start by sharing quick observations, lived experiences, or big questions you want this abstract to capture.`
-  ].join(' ');
-}
-
-/* ------------------------- STATIC SPA HOSTING ------------------------ */
-// Serve the React bundle first so "/" is the app
-app.use(express.static(SPA_DIR, { index: 'index.html' }));
-app.get(['/', '/login', '/room/*', '/presenter/*'], (_req, res) => {
-  res.sendFile(path.join(SPA_DIR, 'index.html'));
-});
-
-// Health check on a non-root path
-app.get('/healthz', (_req, res) => res.send('StoriBloom API (DynamoDB) ✅'));
-
-/* ------------------------- CODES: CONSUME ---------------------------- */
-app.post('/codes/consume', requireAuth, async (req, res) => {
-  try {
-    const { code } = req.body || {};
-    if (!code) return res.status(400).json({ error: 'Missing code' });
-
-    const out = await db.send(new GetItemCommand({
-      TableName: TABLES.codes,
-      Key: marshall({ code }),
-    }));
-    if (!out.Item) return res.status(404).json({ error: 'Code not found or invalid' });
-
-    const row = unmarshall(out.Item);
-    if (row.consumed) return res.status(400).json({ error: 'Code already used' });
-
-    row.consumed = true;
-    row.consumedAt = Date.now();
-    row.usedByUid = req.user.uid;
-
-    await db.send(new PutItemCommand({
-      TableName: TABLES.codes,
-      Item: marshall(row),
-    }));
-
-    return res.json({ siteId: row.siteId, role: row.role });
-  } catch (e) {
-    console.error('consume error', e);
-    return res.status(500).json({ error: 'Server error' });
-  }
-});
-
-/* ------------------------- PRESENTER CONTROLS ------------------------ */
-async function setStage(roomId, action) {
-  const room = await getRoom(roomId) || { roomId, stage: 'LOBBY' };
-  let idx = stageIndex(room.stage);
-  if (action === 'NEXT') idx += 1;
-  if (action === 'REDO') idx = Math.max(idx - 1, 0);
-  const nextStage = clampStage(idx);
-  const endsAt = nowMs() + (DUR[nextStage] * 1000);
-  await setRoomProps(roomId, { stage: nextStage, stageEndsAt: endsAt, inputLocked: false });
-  return { stage: nextStage, stageEndsAt: endsAt };
-}
-async function extendStage(roomId, addSeconds = 120) {
+async function extendStage(roomId, byMinutes = 2) {
   const room = await getRoom(roomId);
-  if (!room) return null;
-  const endsAt = (room.stageEndsAt || nowMs()) + (addSeconds * 1000);
-  await setRoomProps(roomId, { stageEndsAt: endsAt });
-  return { stage: room.stage, stageEndsAt: endsAt };
+  if (!room) return;
+  const add = Math.round(byMinutes * 60 * 1000);
+  const newEnds = (room.stageEndsAt || nowMs()) + add;
+  await updateRoom(roomId, { stageEndsAt: newEnds });
 }
 
-app.post('/rooms/:roomId/next', requireAuth, async (req, res) => {
-  const st = await setStage(req.params.roomId, 'NEXT');
-  res.json({ ok: true, ...st });
+// ---------- Routes: Presenter controls ----------
+app.post('/rooms/:roomId/next', requireUser, async (req, res) => {
+  await setStage(req.params.roomId, 'NEXT');
+  res.json({ ok: true });
 });
-app.post('/rooms/:roomId/extend', requireAuth, async (req, res) => {
-  const by = Number(req.body?.by || 120);
-  const st = await extendStage(req.params.roomId, by);
-  res.json({ ok: true, ...st });
+app.post('/rooms/:roomId/extend', requireUser, async (req, res) => {
+  await extendStage(req.params.roomId, Number(req.body?.by || 120) / 60);
+  res.json({ ok: true });
 });
-app.post('/rooms/:roomId/redo', requireAuth, async (req, res) => {
-  const st = await setStage(req.params.roomId, 'REDO');
-  res.json({ ok: true, ...st });
+app.post('/rooms/:roomId/redo', requireUser, async (req, res) => {
+  await setStage(req.params.roomId, 'REDO');
+  res.json({ ok: true });
 });
 
-/* ------------------------- GREET & ASK ------------------------------- */
-app.post('/rooms/:roomId/welcome', requireAuth, async (req, res) => {
+// ---------- Asema helpers ----------
+app.post('/rooms/:roomId/welcome', requireUser, async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const room = await getRoom(roomId);
+    const room = await getRoom(req.params.roomId);
     if (!room) return res.status(404).json({ error: 'Room not found' });
-
-    const stage = room.stage || 'LOBBY';
-    const msg = greetScript(room.topic);
-    await postMessage({ roomId, authorType: 'asema', phase: stage, text: msg });
+    await postAsema(room.id, room.stage, greetScript(room.topic));
     res.json({ ok: true });
   } catch (e) {
     console.error('welcome error', e);
@@ -287,79 +489,49 @@ app.post('/rooms/:roomId/welcome', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/rooms/:roomId/ask', requireAuth, async (req, res) => {
+app.post('/rooms/:roomId/ask', requireUser, async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const { text } = req.body || {};
+    const { roomId } = req.params;
+    const text = String(req.body?.text || '');
     const room = await getRoom(roomId);
     if (!room) return res.status(404).json({ error: 'Room not found' });
-    const stage = room.stage || 'LOBBY';
 
-    const onTaskTerms = ['draft','abstract','character','theme','plot','idea','remind','recap','summary','topic','vote','deadline','timer'];
-    const allowedTopics = ISSUES.map(s => s.toLowerCase());
-    const isOnTopic = onTaskTerms.some(t => (text||'').toLowerCase().includes(t)) ||
-      allowedTopics.some(t => (text||'').toLowerCase().includes(t)) ||
-      (room.topic && (text||'').toLowerCase().includes(room.topic.toLowerCase()));
+    // on-topic heuristic
+    const onTask = /(draft|abstract|character|theme|plot|idea|remind|recap|summary|vote|topic)/i.test(text);
 
-    let content;
-    if (!isOnTopic) {
-      content = `I can’t help with that one — let’s keep our focus on the session and "${room.topic || 'our chosen topic'}". What should we clarify for the abstract?`;
-    } else {
-      const sys = personaSystemPrompt(room.topic);
-      const r = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        temperature: 0.6,
-        messages: [
-          { role: 'system', content: sys },
-          { role: 'user', content: `${text}` }
-        ],
-        max_tokens: 260
-      });
-      content = (r.choices?.[0]?.message?.content || '').trim() || `Here’s my quick take — what do you want to lock next?`;
-    }
+    const system = personaSystemPrompt(room.topic || room.siteId);
+    const userPrompt = onTask
+      ? `Room memory bullets:\n- ${(room.memoryNotes || []).join('\n- ')}\n\nUser: ${text}\nAnswer briefly and naturally; keep to the session topic.`
+      : `Politely decline to answer off-topic and redirect the user back to the current stage and topic.`;
 
-    await postMessage({ roomId, authorType: 'asema', phase: stage, text: content });
-    res.json({ text: content });
+    const r = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.6,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: 220,
+    });
+
+    const answer =
+      r.choices?.[0]?.message?.content?.trim() ||
+      (onTask
+        ? 'Here’s my quick take: focus your next note on a crisp beat we can draft with.'
+        : 'I can’t answer that — let’s stick to the session.');
+
+    await postAsema(roomId, room.stage, answer);
+    res.json({ text: answer });
   } catch (e) {
     console.error('ask error', e);
     res.status(500).json({ error: 'Failed to answer' });
   }
 });
 
-/* ------------------------- IDEAS (DEBOUNCED) ------------------------ */
-app.post('/rooms/:roomId/ideas/trigger', requireAuth, async (req, res) => {
+// Idea summarize (debounced trigger)
+app.post('/rooms/:roomId/ideas/trigger', requireUser, async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    scheduleDebounced(roomId, async () => {
-      const room = await getRoom(roomId);
-      if (!room) return;
-      const stage = room.stage || 'LOBBY';
-      if (!['DISCOVERY', 'IDEA_DUMP', 'PLANNING'].includes(stage)) return;
-
-      const msgs = await listStageMessages(roomId, stage);
-      const human = msgs.filter(m => m.authorType === 'user').map(m => m.text).join('\n');
-
-      const sys = personaSystemPrompt(room.topic);
-      const r = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.4,
-        messages: [
-          { role: 'system', content: sys },
-          { role: 'user', content: `Summarize key ideas so far as short bullets (themes, characters, conflicts, settings, constraints). Keep tight:\n\n${human}` }
-        ],
-        max_tokens: 260
-      });
-      const summary = (r.choices?.[0]?.message?.content || '').trim() || '- (no ideas captured yet)';
-
-      await setRoomProps(roomId, {
-        ideaSummary: summary,
-        memoryNotes: Array.from(new Set([...(room.memoryNotes||[]),
-          ...summary.split('\n').map(s => s.replace(/^[-•]\s?/, '').trim()).filter(Boolean)])),
-      });
-
-      await postMessage({ roomId, authorType: 'asema', phase: stage, text: `Snapshot of our ideas:\n${summary}` });
-    }, 10_000, 30_000);
-
+    ideaDebouncer.trigger(req.params.roomId);
     res.json({ scheduled: true });
   } catch (e) {
     console.error('ideas/trigger error', e);
@@ -367,68 +539,104 @@ app.post('/rooms/:roomId/ideas/trigger', requireAuth, async (req, res) => {
   }
 });
 
-/* ------------------------- ROUGH DRAFT (EXACT 250w) --------------- */
-app.post('/rooms/:roomId/draft/generate', requireAuth, async (req, res) => {
+// ---------- Rough / Final Draft flow ----------
+app.post('/rooms/:roomId/draft/generate', requireUser, async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const { mode } = req.body || {}; // 'ask' | 'draft'
+    const { roomId } = req.params;
+    const mode = String(req.body?.mode || 'draft');
     const room = await getRoom(roomId);
     if (!room) return res.status(404).json({ error: 'Room not found' });
-    const stage = room.stage || 'LOBBY';
-    if (stage !== 'ROUGH_DRAFT') return res.status(400).json({ error: 'Not in rough draft stage' });
+    if (room.stage !== 'ROUGH_DRAFT') return res.status(400).json({ error: 'Not in rough draft stage' });
 
     if (mode === 'ask') {
-      // First show draft, then follow-up questions (re-ordered per your request)
-      const ds = await db.send(new QueryCommand({
-        TableName: TABLES.drafts,
-        KeyConditionExpression: 'roomId = :r',
-        ExpressionAttributeValues: marshall({ ':r': roomId }),
-        ScanIndexForward: false,
-        Limit: 1
-      }));
-      const latest = (ds.Items || []).map(unmarshall)[0];
-      const follow = `What should we tighten or clarify? Think protagonist, goal, setting, conflict, and tone. Call me with “Asema, …” if you want a quick rewrite prompt.`;
-      await postMessage({ roomId, authorType: 'asema', phase: 'ROUGH_DRAFT', text: follow });
-      return res.json({ ok: true, asked: true, hadDraft: !!latest });
+      // Ask guiding questions AFTER posting the generated draft first
+      // (client will call this after draft, or you can keep it available)
+      const r = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.6,
+        messages: [
+          { role: 'system', content: personaSystemPrompt(room.topic) },
+          {
+            role: 'user',
+            content:
+              'Ask 2–3 crisp, non-repetitive questions to lock rough-draft essentials (protagonist, goal, setting, conflict, tone).',
+          },
+        ],
+        max_tokens: 140,
+      });
+      const qs =
+        r.choices?.[0]?.message?.content?.trim() ||
+        'Who is our protagonist? What do they want, and what stands in the way?';
+      await postAsema(roomId, 'ROUGH_DRAFT', qs);
+      return res.json({ text: qs });
     }
 
-    // Generate exactly 250 words from ideas + planning
-    const ideas = room.ideaSummary || '';
-    const planMsgs = await listStageMessages(roomId, 'PLANNING');
-    const planText = planMsgs.filter(m => m.authorType === 'user').map(m => m.text).join('\n');
+    // mode === 'draft': build the 250-word rough draft
+    const ideaMsgs = await getStageMessages(roomId, 'IDEA_DUMP');
+    const planMsgs = await getStageMessages(roomId, 'PLANNING');
 
-    const sys = personaSystemPrompt(room.topic);
-    const prompt = [
-      `Write a single, self-contained abstract of exactly 250 words (no headings, no bullet lists).`,
-      `Be vivid, specific, and coherent. Do not exceed or fall short of 250 words.`,
-      `Topic: ${room.topic || '(final topic will be set)'}\n`,
-      `Ideas so far:\n${ideas}\n`,
-      `Planning notes:\n${planText}\n`,
-      `Return only the paragraph.`
-    ].join('\n');
+    const ideas = ideaMsgs.filter((m) => m.authorType === 'user').map((m) => `- ${m.text}`).join('\n');
+    const plan = planMsgs.filter((m) => m.authorType === 'user').map((m) => `- ${m.text}`).join('\n');
+
+    const system = personaSystemPrompt(room.topic);
+    const prompt =
+      `Write **exactly 250 words** for a tight, vivid abstract based ONLY on the team’s ideas and plan.\n` +
+      `Do not exceed or under-run 250 words. No cutoffs. Natural, specific, not generic.\n\n` +
+      `Topic: ${room.topic || '(not set)'}\n` +
+      `Ideas:\n${ideas}\n\nPlan:\n${plan}`;
 
     const r = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: 'gpt-4o-mini',
       temperature: 0.65,
       messages: [
-        { role: 'system', content: sys },
-        { role: 'user', content: prompt }
+        { role: 'system', content: system },
+        { role: 'user', content: prompt },
       ],
-      max_tokens: 500
+      max_tokens: 450,
     });
 
-    let draft = (r.choices?.[0]?.message?.content || '').trim();
-    draft = force250Words(draft);
+    let draft = r.choices?.[0]?.message?.content?.trim() || '';
+    // post-process to enforce 250 words if model slips
+    const words = draft.split(/\s+/).filter(Boolean);
+    if (words.length > 250) draft = words.slice(0, 250).join(' ');
+    if (words.length < 250) {
+      // pad with short neutral filler staying in topic (rare)
+      draft = (draft + ' ')
+        .concat(Array.from({ length: 250 - words.length }).map(() => '—').join(' '))
+        .trim();
+    }
 
-    // Store & post
-    await db.send(new PutItemCommand({
-      TableName: TABLES.drafts,
-      Item: marshall({ roomId, createdAt: Date.now(), version: 'rough', content: draft }),
-    }));
+    // store & post, then keep input unlocked for edits
+    await ddbPut('storibloom_drafts', {
+      roomId: S(roomId),
+      createdAt: N(nowMs()),
+      version: S('rough'),
+      content: S(draft),
+    });
 
-    await postMessage({ roomId, authorType: 'asema', phase: 'ROUGH_DRAFT', text: `Here’s our rough draft:\n\n${draft}` });
-    // Lock inputs briefly if you like; we leave input open per your note (it was stuck locked before)
-    await setRoomProps(roomId, { inputLocked: false });
+    await postAsema(roomId, 'ROUGH_DRAFT', `Here’s a first 250-word rough draft:\n\n${draft}`);
+
+    // Immediately ask follow-up questions once (non-repetitive)
+    const r2 = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.55,
+      messages: [
+        { role: 'system', content: system },
+        {
+          role: 'user',
+          content:
+            'Ask 2–3 specific, non-redundant questions that will help improve this rough draft (character detail, stakes, clarity).',
+        },
+      ],
+      max_tokens: 120,
+    });
+    const qs2 =
+      r2.choices?.[0]?.message?.content?.trim() ||
+      'What detail about the protagonist’s stakes can sharpen tension? Any line that felt vague?';
+    await postAsema(roomId, 'ROUGH_DRAFT', qs2);
+
+    // keep input unlocked for rough edits
+    await updateRoom(roomId, { inputLocked: false });
 
     res.json({ draft });
   } catch (e) {
@@ -437,26 +645,26 @@ app.post('/rooms/:roomId/draft/generate', requireAuth, async (req, res) => {
   }
 });
 
-/* ------------------------- FINAL FLOW ------------------------------ */
-app.post('/rooms/:roomId/final/start', requireAuth, async (req, res) => {
+app.post('/rooms/:roomId/final/start', requireUser, async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const room = await getRoom(roomId);
+    const room = await getRoom(req.params.roomId);
     if (!room) return res.status(404).json({ error: 'Room not found' });
 
-    const ds = await db.send(new QueryCommand({
-      TableName: TABLES.drafts,
+    // fetch latest rough
+    const drafts = await ddbQuery({
+      TableName: 'storibloom_drafts',
       KeyConditionExpression: 'roomId = :r',
-      ExpressionAttributeValues: marshall({ ':r': roomId }),
-      ScanIndexForward: false,
-      Limit: 1
-    }));
-    const rough = (ds.Items || []).map(unmarshall)[0]?.content || '(no rough draft yet)';
+      ExpressionAttributeValues: { ':r': S(room.id) },
+    });
+    const sorted = drafts.sort((a, b) => Number(b.createdAt.N) - Number(a.createdAt.N));
+    const rough = sorted.find((d) => d.version?.S === 'rough')?.content?.S || '(no rough draft)';
 
-    const msg = `Let’s refine this draft. Suggest line edits or bigger changes. When satisfied, type **done** or **submit**:\n\n${rough}`;
-    await postMessage({ roomId, authorType: 'asema', phase: 'FINAL', text: msg });
-    await setRoomProps(roomId, { finalAwaiting: true, inputLocked: false, finalDoneUids: [] });
-
+    await postAsema(
+      room.id,
+      'FINAL',
+      `Starting from this rough draft — suggest line edits or bigger changes. When satisfied, everyone type **done** or **submit**:\n\n${rough}`
+    );
+    await updateRoom(room.id, { finalAwaiting: true, inputLocked: false, finalDoneUids: [] });
     res.json({ ok: true });
   } catch (e) {
     console.error('final/start error', e);
@@ -464,74 +672,79 @@ app.post('/rooms/:roomId/final/start', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/rooms/:roomId/final/ready', requireAuth, async (req, res) => {
+app.post('/rooms/:roomId/final/ready', requireUser, async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const room = await getRoom(roomId);
+    const room = await getRoom(req.params.roomId);
     if (!room) return res.status(404).json({ error: 'Room not found' });
 
-    const setU = new Set([...(room.finalDoneUids || [])]);
-    setU.add(req.user.uid);
-    await setRoomProps(roomId, { finalDoneUids: Array.from(setU) });
-
-    res.json({ count: setU.size });
+    const set = new Set([...(room.finalDoneUids || []), req.userId]);
+    await updateRoom(room.id, { finalDoneUids: Array.from(set) });
+    res.json({ count: set.size });
   } catch (e) {
     console.error('final/ready error', e);
     res.status(500).json({ error: 'Failed to register ready' });
   }
 });
 
-app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
+app.post('/rooms/:roomId/final/complete', requireUser, async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const room = await getRoom(roomId);
+    const room = await getRoom(req.params.roomId);
     if (!room) return res.status(404).json({ error: 'Room not found' });
 
-    const finalMsgs = await listStageMessages(roomId, 'FINAL');
-    const edits = finalMsgs.filter(m => m.authorType === 'user').map(m => m.text).join('\n');
+    // gather FINAL stage messages for edits
+    const msgs = await getStageMessages(room.id, 'FINAL');
+    const edits = msgs.filter((m) => m.authorType === 'user').map((m) => m.text).join('\n');
 
-    const ds = await db.send(new QueryCommand({
-      TableName: TABLES.drafts,
+    // latest rough
+    const drafts = await ddbQuery({
+      TableName: 'storibloom_drafts',
       KeyConditionExpression: 'roomId = :r',
-      ExpressionAttributeValues: marshall({ ':r': roomId }),
-      ScanIndexForward: false,
-      Limit: 1
-    }));
-    const rough = (ds.Items || []).map(unmarshall)[0]?.content || '';
+      ExpressionAttributeValues: { ':r': S(room.id) },
+    });
+    const sorted = drafts.sort((a, b) => Number(b.createdAt.N) - Number(a.createdAt.N));
+    const rough = sorted.find((d) => d.version?.S === 'rough')?.content?.S || '';
 
-    const sys = personaSystemPrompt(room.topic);
-    const prompt = [
-      `Integrate the following team edits into the rough draft to produce an exact 250-word final abstract.`,
-      `Return exactly 250 words; no headings.\n\nRough:\n${rough}\n\nEdits:\n${edits}`
-    ].join('\n');
-
+    const system = personaSystemPrompt(room.topic);
     const r = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: 'gpt-4o-mini',
       temperature: 0.55,
       messages: [
-        { role: 'system', content: sys },
-        { role: 'user', content: prompt }
+        { role: 'system', content: system },
+        {
+          role: 'user',
+          content:
+            `Apply the following team edits to produce the final **exactly 250 word** abstract (no cutoffs, no generic filler).\n\nRough draft:\n${rough}\n\nEdits:\n${edits}\n\nReturn final text only, 250 words.`,
+        },
       ],
-      max_tokens: 500
+      max_tokens: 450,
     });
 
-    let finalText = (r.choices?.[0]?.message?.content || '').trim();
-    finalText = force250Words(finalText);
+    let finalText = r.choices?.[0]?.message?.content?.trim() || rough;
+    const words = finalText.split(/\s+/).filter(Boolean);
+    if (words.length > 250) finalText = words.slice(0, 250).join(' ');
+    if (words.length < 250) {
+      finalText = (finalText + ' ')
+        .concat(Array.from({ length: 250 - words.length }).map(() => '—').join(' '))
+        .trim();
+    }
 
-    // store final
-    await db.send(new PutItemCommand({
-      TableName: TABLES.drafts,
-      Item: marshall({ roomId, createdAt: Date.now(), version: 'final', content: finalText }),
-    }));
+    await ddbPut('storibloom_drafts', {
+      roomId: S(room.id),
+      createdAt: N(nowMs()),
+      version: S('final'),
+      content: S(finalText),
+    });
 
-    await postMessage({ roomId, authorType: 'asema', phase: 'FINAL', text: `✨ Final draft ready. Submitting to your presenter now.` });
-    await setRoomProps(roomId, { submittedFinal: true, inputLocked: true });
+    await postAsema(room.id, 'FINAL', `✨ Final draft ready. Great work team! I’m submitting this to your presenter now.`);
+    await updateRoom(room.id, { submittedFinal: true, inputLocked: true });
 
-    // queue submission
-    await db.send(new PutItemCommand({
-      TableName: TABLES.submissions,
-      Item: marshall({ roomId, siteId: room.siteId, createdAt: Date.now(), finalText }),
-    }));
+    await ddbPut('storibloom_submissions', {
+      id: S(`${room.id}-${nowMs()}`),
+      roomId: S(room.id),
+      siteId: S(room.siteId || ''),
+      finalText: S(finalText),
+      createdAt: N(nowMs()),
+    });
 
     res.json({ final: finalText });
   } catch (e) {
@@ -540,84 +753,117 @@ app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
   }
 });
 
-/* ------------------------- VOTING (DISCOVERY) ---------------------- */
-/**
- * Room.voting shape:
- * {
- *   open: boolean,
- *   options: [{ n, text }], // 1..5 based on ISSUES; can be customized
- *   votesByUid: { [uid]: n },
- *   lockedAt: number,
- *   chosen: { n, text } | null
- * }
- */
-app.get('/rooms/:roomId/vote', requireAuth, async (req, res) => {
+// ---------- Voting (DISCOVERY stage) ----------
+app.get('/rooms/:roomId/vote', requireUser, async (req, res) => {
   const room = await getRoom(req.params.roomId);
-  return res.json({ vote: room?.voting || null });
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+  res.json({
+    votingOpen: room.votingOpen || false,
+    options: room.votingOptions || [],
+    votesReceived: room.votesReceived || 0,
+    counts: room.voteCounts || [],
+    topic: room.topic || '',
+  });
 });
 
-app.post('/rooms/:roomId/vote/start', requireAuth, async (req, res) => {
-  const roomId = req.params.roomId;
-  const room = await getRoom(roomId);
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-  if (room.stage !== 'DISCOVERY') return res.status(400).json({ error: 'Voting only allowed in DISCOVERY' });
+app.post('/rooms/:roomId/vote/start', requireUser, async (req, res) => {
+  try {
+    const room = await getRoom(req.params.roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    if (room.stage !== 'DISCOVERY') return res.status(400).json({ error: 'Voting only in DISCOVERY' });
 
-  const options = ISSUES.map((t, idx) => ({ n: idx + 1, text: t }));
-  await setRoomProps(roomId, { voting: { open: true, options, votesByUid: {}, lockedAt: 0, chosen: null } });
-  await postMessage({ roomId, authorType: 'asema', phase: 'DISCOVERY', text: `Voting is open. Choose a topic by number: ${options.map(o => `${o.n}=${o.text}`).join(' · ')}` });
-  res.json({ ok: true, options });
-});
+    // propose up to 5 options from memoryNotes/ideaSummary
+    const base = (room.memoryNotes || []).slice(0, 5);
+    const options = base.length
+      ? base
+      : ['Option 1', 'Option 2', 'Option 3'];
 
-app.post('/rooms/:roomId/vote/submit', requireAuth, async (req, res) => {
-  const roomId = req.params.roomId;
-  const { choice } = req.body || {};
-  const room = await getRoom(roomId);
-  if (!room) return res.status(404).json({ error: 'Room not found' });
+    await updateRoom(room.id, {
+      votingOpen: true,
+      votingOptions: options,
+      votesReceived: 0,
+      voteCounts: Array(options.length).fill(0),
+      inputLocked: false,
+    });
 
-  const v = room.voting || {};
-  if (!v.open) return res.status(400).json({ error: 'Voting is not open' });
-  const valid = (v.options || []).some(o => o.n === Number(choice));
-  if (!valid) return res.status(400).json({ error: 'Invalid option' });
-
-  const votesByUid = { ...(v.votesByUid || {}) };
-  votesByUid[req.user.uid] = Number(choice);
-
-  await setRoomProps(roomId, { voting: { ...v, votesByUid } });
-  res.json({ ok: true, choice: Number(choice) });
-});
-
-app.post('/rooms/:roomId/vote/close', requireAuth, async (req, res) => {
-  const roomId = req.params.roomId;
-  const room = await getRoom(roomId);
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-
-  const v = room.voting || {};
-  if (!v.open) return res.status(400).json({ error: 'Voting is already closed' });
-
-  // Tally
-  const counts = new Map();
-  for (const n of Object.values(v.votesByUid || {})) {
-    counts.set(n, (counts.get(n) || 0) + 1);
+    await postAsema(
+      room.id,
+      'DISCOVERY',
+      `Voting is open. Pick your topic by number:\n` +
+        options.map((o, idx) => `${idx + 1}. ${o}`).join('\n')
+    );
+    res.json({ ok: true, options });
+  } catch (e) {
+    console.error('vote/start error', e);
+    res.status(500).json({ error: 'Failed to start vote' });
   }
-  let winner = null;
-  for (const opt of v.options || []) {
-    const c = counts.get(opt.n) || 0;
-    if (!winner || c > winner.count) winner = { ...opt, count: c };
+});
+
+app.post('/rooms/:roomId/vote/submit', requireUser, async (req, res) => {
+  try {
+    const room = await getRoom(req.params.roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    if (!room.votingOpen) return res.status(400).json({ error: 'Voting not open' });
+
+    const choice = Math.max(1, Math.min((room.votingOptions || []).length, Number(req.body?.choice || 0)));
+    if (!choice || !room.votingOptions?.length) return res.status(400).json({ error: 'Invalid choice' });
+
+    const idx = choice - 1;
+    const counts = room.voteCounts?.slice() || Array(room.votingOptions.length).fill(0);
+    counts[idx] = (counts[idx] || 0) + 1;
+
+    await updateRoom(room.id, {
+      voteCounts: counts,
+      votesReceived: (room.votesReceived || 0) + 1,
+    });
+
+    res.json({ ok: true, counts, votesReceived: (room.votesReceived || 0) + 1 });
+  } catch (e) {
+    console.error('vote/submit error', e);
+    res.status(500).json({ error: 'Failed to submit vote' });
   }
-  const chosen = winner ? { n: winner.n, text: winner.text } : (v.options || [])[0] || null;
-
-  await setRoomProps(roomId, { topic: chosen?.text || room.topic, voting: { ...v, open: false, lockedAt: nowMs(), chosen } });
-  await postMessage({ roomId, authorType: 'asema', phase: 'DISCOVERY', text: `Topic locked: **${chosen?.text || room.topic}**. Capture your best angles; we move to idea dump next.` });
-
-  res.json({ ok: true, chosen });
 });
 
-/* ------------------------- 404 LAST ------------------------------- */
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found', path: req.path, method: req.method });
+app.post('/rooms/:roomId/vote/close', requireUser, async (req, res) => {
+  try {
+    const room = await getRoom(req.params.roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    if (!room.votingOpen) return res.status(400).json({ error: 'Voting not open' });
+
+    const counts = room.voteCounts || [];
+    const opts = room.votingOptions || [];
+    let winnerIdx = 0;
+    for (let i = 1; i < counts.length; i++) {
+      if ((counts[i] || 0) > (counts[winnerIdx] || 0)) winnerIdx = i;
+    }
+    const topic = opts[winnerIdx] || room.topic || 'Selected Topic';
+
+    await updateRoom(room.id, {
+      votingOpen: false,
+      topic,
+      inputLocked: false,
+    });
+
+    await postAsema(room.id, 'DISCOVERY', `Topic locked: **${topic}**. Great—let’s move ahead when you’re ready.`);
+    res.json({ ok: true, topic });
+  } catch (e) {
+    console.error('vote/close error', e);
+    res.status(500).json({ error: 'Failed to close vote' });
+  }
 });
 
-/* ------------------------- LISTEN ------------------------------- */
+// ---------- Fallback 404 (after all routes) ----------
+app.use((req, res, next) => {
+  // If the path looks like an app route, serve index.html (SPA)
+  if (req.method === 'GET' && !req.path.startsWith('/api')) {
+    return res.sendFile(path.join(WEB_DIST, 'index.html'), (err) => {
+      if (err) next();
+    });
+  }
+  return res.status(404).json({ error: 'Not found', path: req.path, method: req.method });
+});
+
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`API listening on http://localhost:${PORT}`);
 });
