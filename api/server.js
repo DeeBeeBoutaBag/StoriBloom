@@ -71,6 +71,18 @@ app.options('*', cors());
 // JSON body
 app.use(express.json({ limit: '1mb' }));
 
+// guest login: issues a simple UID + opaque token the frontend can use in x-user-id / x-guest-token
+app.post('/auth/guest', (req, res) => {
+  try {
+    const uid = 'guest_' + Math.random().toString(36).slice(2, 10);
+    const token = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    res.json({ uid, token });
+  } catch (e) {
+    console.error('guest auth error', e);
+    res.status(500).json({ error: 'guest auth failed' });
+  }
+});
+
 // Optional middleware
 if (compression) app.use(compression());
 if (morgan) app.use(morgan('tiny'));
