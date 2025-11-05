@@ -1,298 +1,255 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useParams } from 'react-router-dom';
-import {
-  ensureGuest,
-  bearer as bearerHeaders,
-  getRoomState,
-  getMessages,
-  API_BASE,
-} from '../api';
-
+import { awsHeaders } from '../lib/awsAuth';
 import TopBanner from '../components/TopBanner.jsx';
 import CountdownRing from '../components/CountdownRing.jsx';
 import ChatMessage from '../components/ChatMessage.jsx';
 import IdeaSidebar from '../components/IdeaSidebar.jsx';
+import { useRoomVoting } from '../hooks/useRoomVoting';
 
+// Stages/order + default durations (seconds)
 const ORDER = ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','ROUGH_DRAFT','EDITING','FINAL'];
 const TOTAL_BY_STAGE = {
-  LOBBY: 60, DISCOVERY: 600, IDEA_DUMP: 180, PLANNING: 600,
-  ROUGH_DRAFT: 240, EDITING: 600, FINAL: 360,
+  LOBBY: 60,
+  DISCOVERY: 600,
+  IDEA_DUMP: 180,
+  PLANNING: 600,
+  ROUGH_DRAFT: 240,
+  EDITING: 600,
+  FINAL: 360,
 };
-
-const ISSUES = [
-  'Law Enforcement Profiling',
-  'Food Deserts',
-  'Redlining',
-  'Homelessness',
-  'Wealth Gap',
-];
 
 export default function Room() {
   const { roomId } = useParams();
 
-  // Personas from login (device may be individual or pair)
+  // Room meta + stage state
+  const [stage, setStage] = useState('LOBBY');
+  const [stageEndsAt, setStageEndsAt] = useState(null);
+  const [roomMeta, setRoomMeta] = useState({ siteId: '', index: 1, inputLocked: false, ideaSummary: '' });
+
+  // Messages scoped by current stage
+  const [messages, setMessages] = useState([]);
+
+  // Compose state
+  const [text, setText] = useState('');
+  const [activePersona, setActivePersona] = useState(0);
+
+  // Personas from login
   const personas = useMemo(() => {
     try { return JSON.parse(sessionStorage.getItem('personas') || '["🙂"]'); }
     catch { return ['🙂']; }
   }, []);
   const mode = sessionStorage.getItem('mode') || 'individual';
 
-  // Room state
-  const [stage, setStage] = useState('LOBBY');
-  const [stageEndsAt, setStageEndsAt] = useState(null);
-  const [roomMeta, setRoomMeta] = useState({
-    siteId: '', index: 1, inputLocked: false, topic: null,
-  });
+  // Voting (during DISCOVERY)
+  const { status: voteStatus, loading: voteLoading, startVoting, submitVote, closeVoting, refresh: refreshVote } =
+    useRoomVoting(roomId);
 
-  // Messages + polling
-  const [messages, setMessages] = useState([]);
-  const [lastTs, setLastTs] = useState(0);
-
-  // Idea sidebar
-  const [ideaSummary, setIdeaSummary] = useState('');
-
-  // Compose
-  const [text, setText] = useState('');
-  const [activePersona, setActivePersona] = useState(0);
-
-  // Voting (DISCOVERY)
-  const [voteStatus, setVoteStatus] = useState({
-    open: false,
-    options: ISSUES,
-    total: 0,
-    submitted: false,
-    myChoice: null,
-    tallies: null,
-  });
-
-  // UX timers, scroll
-  const [nowTick, setNowTick] = useState(Date.now());
-  const [sentWelcome, setSentWelcome] = useState(false);
-  const [askedRoughQs, setAskedRoughQs] = useState(false);
+  // Live countdown tick + autoscroll refs
   const scrollRef = useRef(null);
+  const [nowTick, setNowTick] = useState(Date.now());
 
-  // keep time moving
+  // One-time flags to prevent duplicate calls
+  const [welcomeSent, setWelcomeSent] = useState(false);
+  const [roughGenerated, setRoughGenerated] = useState(false);
+  const [roughQsAsked, setRoughQsAsked] = useState(false);
+
+  // -------- Poll helpers (no websockets) --------
+  const fetchRoom = useCallback(async () => {
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}`, { ...(await awsHeaders()) });
+      if (!res.ok) return;
+      const j = await res.json();
+      setStage(j.stage || 'LOBBY');
+      setStageEndsAt(j.stageEndsAt ? new Date(j.stageEndsAt) : null);
+      setRoomMeta(m => ({
+        ...m,
+        siteId: j.siteId || roomId.split('-')[0],
+        index: j.index || 1,
+        inputLocked: !!j.inputLocked,
+        ideaSummary: j.ideaSummary || m.ideaSummary || ''
+      }));
+    } catch {}
+  }, [roomId]);
+
+  const fetchMessages = useCallback(async (phase) => {
+    try {
+      const res = await fetch(
+        `${import.meta.env.VITE_API_URL}/rooms/${roomId}/messages?phase=${encodeURIComponent(phase)}`,
+        { ...(await awsHeaders()) }
+      );
+      if (!res.ok) return;
+      const j = await res.json();
+      setMessages(j.messages || []);
+      requestAnimationFrame(() => {
+        const el = scrollRef.current;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    } catch {}
+  }, [roomId]);
+
+  // Poll room + messages every 2s
+  useEffect(() => {
+    fetchRoom();
+    fetchMessages(stage);
+    const t1 = setInterval(fetchRoom, 2000);
+    const t2 = setInterval(() => fetchMessages(stage), 2000);
+    return () => { clearInterval(t1); clearInterval(t2); };
+  }, [fetchRoom, fetchMessages, stage]);
+
+  // Tick for timer ring
   useEffect(() => {
     const t = setInterval(() => setNowTick(Date.now()), 500);
     return () => clearInterval(t);
   }, []);
 
-  // initial guest token + persona registration (optional)
+  // Auto-greet when DISCOVERY begins (once)
   useEffect(() => {
     (async () => {
-      await ensureGuest();
-      try {
-        await fetch(`${API_BASE}/rooms/${roomId}/personas`, {
-          method: 'POST',
-          ...(await bearerHeaders()),
-          body: JSON.stringify({ mode, personas }),
-        });
-      } catch { /* noop */ }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // poll room state every 2s
-  useEffect(() => {
-    let mounted = true;
-    async function tickState() {
-      try {
-        const st = await getRoomState(roomId);
-        if (!mounted) return;
-        setStage(st.stage || 'LOBBY');
-        setStageEndsAt(st.stageEndsAt ? new Date(st.stageEndsAt) : null);
-        setRoomMeta({
-          siteId: st.siteId || roomId.split('-')[0],
-          index: st.index || 1,
-          inputLocked: !!st.inputLocked,
-          topic: st.topic || null,
-        });
-        setIdeaSummary(st.ideaSummary || '');
-
-        // update voting HUD if present in state
-        if (st.vote) {
-          setVoteStatus(v => ({
-            ...v,
-            open: !!st.vote.open,
-            options: st.vote.options || ISSUES,
-            total: st.vote.total || 0,
-            submitted: !!st.vote.submitted, // server can flag if this uid voted
-            myChoice: st.vote.myChoice ?? v.myChoice,
-            tallies: st.vote.tallies || null,
-          }));
-        }
-      } catch { /* noop */ }
-    }
-    tickState();
-    const id = setInterval(tickState, 2000);
-    return () => { mounted = false; clearInterval(id); };
-  }, [roomId]);
-
-  // poll messages every 2s (only new since lastTs)
-  useEffect(() => {
-    let mounted = true;
-    async function tickMsgs() {
-      try {
-        const data = await getMessages(roomId, lastTs || 0, null);
-        if (!mounted) return;
-        if (Array.isArray(data.items) && data.items.length) {
-          setMessages(prev => [...prev, ...data.items]);
-          setLastTs(data.lastTs || Date.now());
-          // autoscroll
-          requestAnimationFrame(() => {
-            const el = scrollRef.current;
-            if (el) el.scrollTop = el.scrollHeight;
-          });
-        }
-      } catch { /* noop */ }
-    }
-    tickMsgs();
-    const id = setInterval(tickMsgs, 2000);
-    return () => { mounted = false; clearInterval(id); };
-  }, [roomId, lastTs]);
-
-  // greet when DISCOVERY begins (once)
-  useEffect(() => {
-    (async () => {
-      if (stage === 'DISCOVERY' && !sentWelcome) {
-        setSentWelcome(true);
+      if (stage === 'DISCOVERY' && !welcomeSent) {
+        setWelcomeSent(true);
         try {
-          await fetch(`${API_BASE}/rooms/${roomId}/welcome`, {
+          await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/welcome`, {
             method: 'POST',
-            ...(await bearerHeaders()),
+            ...(await awsHeaders()),
           });
-        } catch { /* noop */ }
+        } catch {}
       }
     })();
-  }, [stage, sentWelcome, roomId]);
+  }, [stage, welcomeSent, roomId]);
 
-  // ask guiding qs once in rough draft (server will *first* generate the draft)
+  // ROUGH_DRAFT sequence:
+  // 1) Generate rough (exactly 250 words) and show it first.
+  // 2) Then ask 2–3 guiding questions and UNLOCK input.
   useEffect(() => {
     (async () => {
-      if (stage === 'ROUGH_DRAFT' && !askedRoughQs) {
-        setAskedRoughQs(true);
-        try {
-          // We call draft/generate with mode='draft' first so Asema posts the draft,
-          // then prompt questions (mode='ask').
-          await fetch(`${API_BASE}/rooms/${roomId}/draft/generate`, {
-            method: 'POST',
-            ...(await bearerHeaders()),
-            body: JSON.stringify({ mode: 'draft' }),
-          });
-          await fetch(`${API_BASE}/rooms/${roomId}/draft/generate`, {
-            method: 'POST',
-            ...(await bearerHeaders()),
-            body: JSON.stringify({ mode: 'ask' }),
-          });
-        } catch { /* noop */ }
+      if (stage === 'ROUGH_DRAFT') {
+        if (!roughGenerated) {
+          setRoughGenerated(true);
+          try {
+            await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/draft/generate`, {
+              method: 'POST',
+              ...(await awsHeaders()),
+              body: JSON.stringify({ mode: 'draft' }) // server enforces 250 words
+            });
+            // refresh messages so rough appears
+            await fetchMessages('ROUGH_DRAFT');
+          } catch {}
+        } else if (!roughQsAsked) {
+          setRoughQsAsked(true);
+          try {
+            await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/draft/generate`, {
+              method: 'POST',
+              ...(await awsHeaders()),
+              body: JSON.stringify({ mode: 'ask' })
+            });
+          } catch {}
+        }
+      } else {
+        // reset flags when leaving stage
+        setRoughGenerated(false);
+        setRoughQsAsked(false);
       }
     })();
-  }, [stage, askedRoughQs, roomId]);
+  }, [stage, roomId, roughGenerated, roughQsAsked, fetchMessages]);
 
-  // voting HUD polling (only while in DISCOVERY)
+  // Start Final: Asema posts rough + instructions (server toggles locks appropriately)
   useEffect(() => {
-    if (stage !== 'DISCOVERY') return;
-    let mounted = true;
+    (async () => {
+      if (stage === 'FINAL') {
+        try {
+          await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/final/start`, {
+            method: 'POST',
+            ...(await awsHeaders()),
+          });
+          await fetchMessages('FINAL');
+        } catch {}
+      }
+    })();
+  }, [stage, roomId, fetchMessages]);
 
-    const tickVote = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/rooms/${roomId}/vote`, await bearerHeaders());
-        if (!res.ok) return;
-        const j = await res.json();
-        if (!mounted) return;
-        setVoteStatus(v => ({
-          ...v,
-          open: !!j.open,
-          options: j.options || v.options,
-          total: j.total ?? v.total,
-          submitted: !!j.submitted,
-          myChoice: j.myChoice ?? v.myChoice,
-          tallies: j.tallies || v.tallies,
-        }));
-      } catch { /* noop */ }
-    };
-
-    tickVote();
-    const id = setInterval(tickVote, 2000);
-    return () => { mounted = false; clearInterval(id); };
-  }, [roomId, stage]);
-
+  // -------- Actions --------
   async function send() {
     const t = text.trim();
     if (!t) return;
-    const canType = !roomMeta.inputLocked && ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','EDITING','FINAL'].includes(stage);
+
+    // respect input lock (e.g., during server-locks, except FINAL where edits are allowed)
+    const allowedStages = ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','EDITING','FINAL'];
+    const canType = (!roomMeta.inputLocked || stage === 'FINAL') && allowedStages.includes(stage);
     if (!canType) return;
 
     try {
-      await fetch(`${API_BASE}/rooms/${roomId}/messages`, {
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/messages`, {
         method: 'POST',
-        ...(await bearerHeaders()),
+        ...(await awsHeaders()),
         body: JSON.stringify({
-          personaIndex: activePersona,
-          phase: stage,
           text: t,
-        }),
+          phase: stage,
+          personaIndex: activePersona
+        })
       });
-    } catch { /* noop */ }
-    setText('');
+      if (!res.ok) {
+        const j = await res.json().catch(()=>({}));
+        alert(j.error || 'Failed to send');
+        return;
+      }
+      setText('');
+    } catch {}
+    await fetchMessages(stage);
 
-    // If user calls Asema by name, ask
+    // If the user calls Asema by name → ask route (on-topic-only)
     if (/(^|\s)asema[\s,!?]/i.test(t) || /^asema$/i.test(t)) {
       try {
-        await fetch(`${API_BASE}/rooms/${roomId}/ask`, {
+        await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/ask`, {
           method: 'POST',
-          ...(await bearerHeaders()),
+          ...(await awsHeaders()),
           body: JSON.stringify({ text: t }),
         });
-      } catch { /* noop */ }
+      } catch {}
     }
 
-    // Debounced idea summary trigger
+    // During idea phases → trigger debounced summarizer (saves tokens)
     if (stage === 'DISCOVERY' || stage === 'IDEA_DUMP') {
       try {
-        await fetch(`${API_BASE}/rooms/${roomId}/ideas/trigger`, {
+        await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/ideas/trigger`, {
           method: 'POST',
-          ...(await bearerHeaders()),
+          ...(await awsHeaders()),
         });
-      } catch { /* noop */ }
+      } catch {}
     }
 
-    // “done/submit” in FINAL
+    // In FINAL: if someone types "done" or "submit", mark ready
     if (stage === 'FINAL' && /^(done|submit)\b/i.test(t)) {
       try {
-        await fetch(`${API_BASE}/rooms/${roomId}/final/ready`, {
+        await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/final/ready`, {
           method: 'POST',
-          ...(await bearerHeaders()),
+          ...(await awsHeaders()),
         });
-      } catch { /* noop */ }
+      } catch {}
     }
   }
 
+  // Presenter/manual finalize button (for safety)
   async function finalize() {
     try {
-      await fetch(`${API_BASE}/rooms/${roomId}/final/complete`, {
+      await fetch(`${import.meta.env.VITE_API_URL}/rooms/${roomId}/final/complete`, {
         method: 'POST',
-        ...(await bearerHeaders()),
+        ...(await awsHeaders()),
       });
-    } catch { /* noop */ }
+    } catch {}
   }
 
-  // Voting actions (client)
-  async function castVote(idx) {
-    if (!voteStatus.open || voteStatus.submitted) return;
-    try {
-      await fetch(`${API_BASE}/rooms/${roomId}/vote/submit`, {
-        method: 'POST',
-        ...(await bearerHeaders()),
-        body: JSON.stringify({ choice: idx + 1 }),
-      });
-      setVoteStatus(s => ({ ...s, submitted: true, myChoice: idx + 1 }));
-    } catch { /* noop */ }
-  }
-
+  // Stage/time UI helpers
   const total = TOTAL_BY_STAGE[stage] || 1;
   const secsLeft = stageEndsAt ? Math.max(0, Math.floor((stageEndsAt.getTime() - nowTick) / 1000)) : 0;
-  const canType = !roomMeta.inputLocked && ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','EDITING','FINAL'].includes(stage);
+
+  // Input lock: allow typing unless server locked (FINAL always allowed for edits)
+  const canType = (!roomMeta.inputLocked || stage === 'FINAL')
+    && ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','EDITING','FINAL'].includes(stage);
+
+  // Voting UI (only in DISCOVERY)
+  const showVoting = stage === 'DISCOVERY' && (voteStatus.votingOpen || (voteStatus.options?.length || 0) > 0);
+  const canStartVoting = stage === 'DISCOVERY' && !voteStatus.votingOpen && (voteStatus.options?.length || 0) === 0; // presenter usually triggers
 
   return (
     <>
@@ -301,46 +258,98 @@ export default function Room() {
       <div className="grain" />
 
       <div className="room-wrap">
-        <TopBanner siteId={roomMeta.siteId} roomIndex={roomMeta.index} stage={stage} topic={roomMeta.topic} />
+        <TopBanner siteId={roomMeta.siteId} roomIndex={roomMeta.index} stage={stage} />
 
         <div style={{ display: 'grid', gridTemplateColumns: (stage === 'DISCOVERY' || stage === 'IDEA_DUMP' || stage === 'PLANNING') ? '1fr 320px' : '1fr', gap: 14 }}>
           {/* Chat card */}
           <div className="chat">
+            {/* Header */}
             <div className="chat-head">
               <span className="stage-badge">{stage}</span>
-              {roomMeta.topic && <span className="topic-tag">Topic: {roomMeta.topic}</span>}
               <div className="ribbon" style={{ marginLeft: 10 }}>
-                {ORDER.map((s) => (<span key={s} className={s===stage?'on':''}>{s}</span>))}
+                {ORDER.map((s) => (
+                  <span key={s} className={s === stage ? 'on' : ''}>{s}</span>
+                ))}
               </div>
+
               <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
                 <CountdownRing secondsLeft={secsLeft} secondsTotal={total} />
                 <div className="persona-choices" title="Choose persona">
                   {personas.map((p, i) => (
-                    <button key={i} className={i===activePersona?'active':''} onClick={() => setActivePersona(i)}>{p}</button>
+                    <button
+                      key={i}
+                      className={i === activePersona ? 'active' : ''}
+                      onClick={() => setActivePersona(i)}
+                    >
+                      {p}
+                    </button>
                   ))}
                 </div>
               </div>
             </div>
 
-            {/* Messages filtered to current stage */}
+            {/* Messages (filtered to current stage = "clear chat" per phase) */}
             <div ref={scrollRef} className="chat-body">
-              {messages
-                .filter((m) => (m.phase || 'LOBBY') === stage)
-                .map((m) => (
-                  <ChatMessage
-                    key={m.id || `${m.ts}-${m.personaIndex||0}`}
-                    kind={m.authorType === 'asema' ? 'asema' : 'user'}
-                    who={m.authorType === 'asema' ? '🤖' : (personas[m.personaIndex] || personas[0])}
-                    text={m.text}
-                  />
-                ))}
+              {messages.map((m) => (
+                <ChatMessage
+                  key={m.id || `${m.createdAt}-${m.text.substring(0,10)}`}
+                  kind={m.authorType === 'asema' ? 'asema' : 'user'}
+                  who={m.authorType === 'asema' ? '🤖' : (personas[m.personaIndex] || personas[0])}
+                  text={m.text}
+                />
+              ))}
             </div>
+
+            {/* Voting UI (Discovery) */}
+            {showVoting && (
+              <div className="voting-panel">
+                <div className="voting-title">Topic Voting</div>
+                <div className="voting-sub">
+                  Choose the number for your preferred topic. One vote per participant.
+                </div>
+                <div className="voting-options">
+                  {(voteStatus.options || []).map((opt, idx) => (
+                    <button
+                      key={idx}
+                      className="vote-btn"
+                      disabled={voteLoading || !voteStatus.votingOpen}
+                      onClick={() => submitVote(idx + 1)}
+                    >
+                      <span className="vote-num">{idx + 1}</span>
+                      <span className="vote-text">{opt}</span>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="voting-stats">
+                  <div>Votes received: <b>{voteStatus.votesReceived}</b></div>
+                  {!!(voteStatus.counts || []).length && (
+                    <div className="vote-counts">
+                      {(voteStatus.counts || []).map((c, i) => (
+                        <span key={i} className="count-pill">{i + 1}: {c}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Close voting appears if server marks "votingOpen" and you're a presenter in practice;
+                    we don't check role client-side—leave it available for testing. */}
+                {voteStatus.votingOpen && (
+                  <div className="row mt8">
+                    <button className="btn" onClick={closeVoting} disabled={voteLoading}>
+                      Close & Lock Topic
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Input dock */}
             <div className="chat-input">
               <div className="persona-pill">
                 Speaking as <b style={{ fontSize: 16 }}>{personas[activePersona] || personas[0]}</b>
               </div>
+
               <div className="input-pill" style={{ opacity: canType ? 1 : .5 }}>
                 <input
                   placeholder={canType ? 'Type your message… (say "Asema, ..." to ask her)' : 'Input locked in this phase'}
@@ -352,63 +361,21 @@ export default function Room() {
               </div>
               <button className="btn primary" onClick={send} disabled={!canType}>Send</button>
             </div>
-
-            {/* Discovery: voting block */}
-            {stage === 'DISCOVERY' && (
-              <div className="vote-panel">
-                <div className="vote-head">
-                  <div className="label">Voting</div>
-                  <div className={`badge ${voteStatus.open ? 'on' : ''}`}>{voteStatus.open ? 'Open' : 'Closed'}</div>
-                </div>
-
-                {!voteStatus.open && !roomMeta.topic && (
-                  <div className="muted">Waiting for presenter/Asema to open voting…</div>
-                )}
-
-                {voteStatus.open && (
-                  <div className="vote-options">
-                    {voteStatus.options.map((opt, i) => (
-                      <button
-                        key={i}
-                        className={`vote-btn ${voteStatus.myChoice === (i+1) ? 'chosen' : ''}`}
-                        disabled={voteStatus.submitted}
-                        onClick={() => castVote(i)}
-                        title={`Vote #${i+1}`}
-                      >
-                        <span className="num">{i + 1}</span>
-                        <span className="txt">{opt}</span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                {voteStatus.submitted && voteStatus.open && (
-                  <div className="muted small">
-                    Your vote was recorded. Awaiting others…
-                  </div>
-                )}
-
-                {!voteStatus.open && roomMeta.topic && (
-                  <div className="muted">
-                    Topic locked: <b>{roomMeta.topic}</b>
-                  </div>
-                )}
-              </div>
-            )}
           </div>
 
-          {/* Idea Sidebar */}
+          {/* Idea Sidebar (visible in DISCOVERY / IDEA_DUMP / PLANNING) */}
           {(stage === 'DISCOVERY' || stage === 'IDEA_DUMP' || stage === 'PLANNING') && (
-            <IdeaSidebar summary={ideaSummary} />
+            <IdeaSidebar summary={roomMeta.ideaSummary || ''} />
           )}
         </div>
 
-        {/* Stage quick actions */}
+        {/* Stage-specific quick actions */}
         <div className="row mt12">
           {stage === 'FINAL' && (
             <button className="btn primary" onClick={finalize}>Finalize</button>
           )}
-          {roomMeta.inputLocked && <div className="hud-pill" style={{ marginLeft: 'auto' }}>Input Locked</div>}
+          {/* Input lock indicator */}
+          {roomMeta.inputLocked && stage !== 'FINAL' && <div className="hud-pill" style={{ marginLeft: 'auto' }}>Input Locked</div>}
         </div>
       </div>
     </>

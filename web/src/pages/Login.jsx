@@ -42,7 +42,7 @@ export default function Login() {
       // Consume code at AWS API
       const res = await fetch(`${API_BASE}/codes/consume`, {
         method: 'POST',
-        ...(await bearerHeaders()),
+        ...(await awsHeaders()),
         body: JSON.stringify({ code: trimmed }),
       });
 
