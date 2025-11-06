@@ -15,6 +15,21 @@ try { ({ default: morgan } = await import('morgan')); } catch { console.warn('[w
 // AWS SDK v3 (DynamoDB)
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import crypto from 'node:crypto';
+app.post('/auth/guest', (req, res) => {
+  const id = crypto.randomUUID();
+  const token = `guest-${id}`;
+  res.json({ token, userId: id });
+});
+
+async function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token.startsWith('guest-')) return res.status(401).json({ error: 'Missing or invalid token' });
+  // attach user info
+  req.user = { uid: token.replace('guest-', '') };
+  return next();
+}
 
 // ---------- ENV ----------
 /*
