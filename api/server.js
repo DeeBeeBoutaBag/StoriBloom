@@ -31,6 +31,9 @@ Example .env (local dev only; use Render env vars in prod):
 
 PORT=4000
 AWS_REGION=us-west-2
+AWS_ACCESS_KEY_ID=...            # (local or Render)
+AWS_SECRET_ACCESS_KEY=...        # (local or Render)
+AWS_DYNAMO_ENDPOINT=http://localhost:8000   # (optional for DynamoDB Local)
 CORS_ORIGINS=http://localhost:5173
 WEB_DIST_DIR=/opt/StoriBloom/web-dist
 TABLE_CODES=storibloom_codes
@@ -38,18 +41,42 @@ STATIC_INDEX=0
 */
 const PORT = Number(process.env.PORT || 4000);
 const AWS_REGION = process.env.AWS_REGION || 'us-west-2';
+const AWS_DYNAMO_ENDPOINT = process.env.AWS_DYNAMO_ENDPOINT || undefined;
+
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+
 const WEB_DIST_DIR = process.env.WEB_DIST_DIR || '/opt/StoriBloom/web-dist';
 const TABLE_CODES = process.env.TABLE_CODES || 'storibloom_codes';
+
 // Default SPA serving OFF because frontend is on Render Static:
 const ENABLE_SPA = String(process.env.STATIC_INDEX || '0') === '1';
 
 // ---------- AWS ----------
-const ddb = new DynamoDBClient({ region: AWS_REGION });
-const ddbDoc = DynamoDBDocumentClient.from(ddb);
+const ddb = new DynamoDBClient({
+  region: AWS_REGION,
+  ...(AWS_DYNAMO_ENDPOINT ? { endpoint: AWS_DYNAMO_ENDPOINT } : {}),
+});
+const ddbDoc = DynamoDBDocumentClient.from(ddb, {
+  marshallOptions: { removeUndefinedValues: true },
+});
+
+// Log whether credentials/region resolved (helps diagnose CredentialsProviderError)
+(async () => {
+  try {
+    const creds = await ddb.config.credentials();
+    if (creds && creds.accessKeyId) {
+      console.log('[aws] Credentials resolved');
+    } else {
+      console.error('[aws] No AWS credentials resolved');
+    }
+  } catch (e) {
+    console.error('[aws] Failed resolving credentials:', e?.message || e);
+  }
+  console.log(`[aws] region=${AWS_REGION} endpoint=${AWS_DYNAMO_ENDPOINT || '(default)'}`);
+})();
 
 // ---------- Paths ----------
 const __filename = fileURLToPath(import.meta.url);
@@ -60,9 +87,8 @@ const app = express();
 app.set('trust proxy', true); // behind Render proxy
 app.disable('x-powered-by');
 
-// ---------- CORS (optional) ----------
-// If you proxy /api/* from the Static Site to this API (recommended), you can leave CORS_ORIGINS empty.
-// If not proxying, set CORS_ORIGINS to your static site origin(s).
+// ---------- CORS ----------
+// If your Static Site rewrites /api/* → this API, CORS can be wide open (or left empty).
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -97,7 +123,7 @@ app.use((req, _res, next) => {
  * Response: { token: "guest-<uuid>", userId: "<uuid>" }
  * Usage on client: send "Authorization: Bearer guest-<uuid>"
  */
-app.post('/auth/guest', (_req, res) => {
+function handleGuestAuth(_req, res) {
   try {
     const id = crypto.randomUUID();
     const token = `guest-${id}`;
@@ -106,7 +132,10 @@ app.post('/auth/guest', (_req, res) => {
     console.error('[auth/guest] error:', e);
     res.status(500).json({ error: 'guest auth failed' });
   }
-});
+}
+app.post('/auth/guest', handleGuestAuth);
+// Optional alias in case your proxy doesn’t strip /api
+app.post('/api/auth/guest', handleGuestAuth);
 
 /**
  * Middleware requires:
@@ -132,21 +161,12 @@ async function requireAuth(req, res, next) {
 }
 
 // ---------- Health / Version ----------
-app.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
-    region: AWS_REGION,
-    time: new Date().toISOString(),
-  });
-});
+function healthPayload() {
+  return { ok: true, region: AWS_REGION, time: new Date().toISOString() };
+}
+app.get('/health', (_req, res) => res.json(healthPayload()));
 // Optional alias if you ever want /api/health without a proxy rewrite:
-app.get('/api/health', (_req, res) => {
-  res.json({
-    ok: true,
-    region: AWS_REGION,
-    time: new Date().toISOString(),
-  });
-});
+app.get('/api/health', (_req, res) => res.json(healthPayload()));
 
 app.get('/version', (_req, res) => {
   res.json({
@@ -262,7 +282,7 @@ if (distHasIndex) {
 app.get('/', (_req, res) => {
   if (!ENABLE_SPA || !distHasIndex) {
     return res.status(200).send('StoriBloom API (DynamoDB) ✅');
-  }
+    }
   const indexPath = path.join(distDir, 'index.html');
   res.sendFile(indexPath, (err) => {
     if (err) {
@@ -328,6 +348,7 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`API listening on 0.0.0.0:${PORT}`);
   console.log(`[env] region=${AWS_REGION}`);
+  console.log(`[env] endpoint=${AWS_DYNAMO_ENDPOINT || '(default)'}`);
   console.log(`[env] CORS_ORIGINS=${CORS_ORIGINS.length ? CORS_ORIGINS.join(',') : '(all)'}`);
   console.log(`[env] static dir=${distDir} (present=${distHasIndex}) SPA=${ENABLE_SPA}`);
 });
