@@ -3,7 +3,7 @@
 import React, { useState, useRef } from 'react';
 import { motion, useMotionValue, useTransform } from 'framer-motion';
 import EmojiDrawer from '../components/EmojiDrawer.jsx';
-import { ensureGuest, authHeaders, API_BASE } from '../api.js';
+import { ensureGuest, bearer as bearerHeaders, API_BASE } from '../api.js';
 
 export default function Login() {
   const [code, setCode] = useState('');
