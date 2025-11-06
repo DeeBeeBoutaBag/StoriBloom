@@ -1,6 +1,6 @@
 // web/src/hooks/useRoomVoting.js
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { authHeaders, API_BASE } from '../api.js';
+import { authHeaders, API_BASE as API } from '../api';
 
 export function useRoomVoting(roomId) {
   const [status, setStatus] = useState({
@@ -15,10 +15,7 @@ export function useRoomVoting(roomId) {
   const fetchStatus = useCallback(async () => {
     if (!roomId) return;
     try {
-      const res = await fetch(`${API_BASE}/rooms/${roomId}/vote`, {
-        method: 'GET',
-        headers: await authHeaders(),
-      });
+      const res = await fetch(`${API}/rooms/${roomId}/vote`, { headers: await authHeaders().then(h => h.headers) });
       if (!res.ok) return;
       const json = await res.json();
       setStatus({
@@ -36,9 +33,9 @@ export function useRoomVoting(roomId) {
     if (!roomId) return false;
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/rooms/${roomId}/vote/start`, {
+      const res = await fetch(`${API}/rooms/${roomId}/vote/start`, {
         method: 'POST',
-        headers: await authHeaders(),
+        headers: await authHeaders().then(h => h.headers),
       });
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
@@ -56,10 +53,10 @@ export function useRoomVoting(roomId) {
       if (!roomId) return false;
       setLoading(true);
       try {
-        const res = await fetch(`${API_BASE}/rooms/${roomId}/vote/submit`, {
+        const res = await fetch(`${API}/rooms/${roomId}/vote/submit`, {
           method: 'POST',
-          headers: await authHeaders(),
-          body: JSON.stringify({ choice: Number(choice) }),
+          headers: await authHeaders().then(h => h.headers),
+          body: JSON.stringify({ choice }),
         });
         if (!res.ok) {
           const j = await res.json().catch(() => ({}));
@@ -78,9 +75,9 @@ export function useRoomVoting(roomId) {
     if (!roomId) return false;
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/rooms/${roomId}/vote/close`, {
+      const res = await fetch(`${API}/rooms/${roomId}/vote/close`, {
         method: 'POST',
-        headers: await authHeaders(),
+        headers: await authHeaders().then(h => h.headers),
       });
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));

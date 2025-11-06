@@ -44,7 +44,7 @@ export default function Login() {
       // Consume code via API (uses Authorization: Bearer <token>)
       const res = await fetch(`${API_BASE}/codes/consume`, {
         method: 'POST',
-        headers: await authHeaders(),
+        ...(await bearerHeaders()),
         body: JSON.stringify({ code: trimmed }),
       });
 
