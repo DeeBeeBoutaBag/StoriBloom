@@ -9,6 +9,7 @@
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.922.0",
     "@aws-sdk/lib-dynamodb": "^3.922.0",
+    "compression": "^1.8.1",
     "yargs": "^17.7.2"
   }
 }

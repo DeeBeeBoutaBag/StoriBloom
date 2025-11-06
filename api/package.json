@@ -2,22 +2,23 @@
   "name": "asemacollab-lite-api",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20 <21" },
+  "engines": {
+    "node": ">=20 <21"
+  },
   "scripts": {
     "dev": "node server.js",
     "start": "node server.js"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3",
+    "@aws-sdk/lib-dynamodb": "^3",
     "body-parser": "^2.2.0",
+    "compression": "^1.8.1",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
-    "compression": "^1",
     "morgan": "^1.10.1",
     "openai": "^4.104.0",
-    "@aws-sdk/client-dynamodb": "^3",
-    "@aws-sdk/lib-dynamodb": "^3",
     "zod": "^3"
-    
   }
 }
