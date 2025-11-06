@@ -6,12 +6,11 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // forward /api -> your local API
       '/api': {
         target: 'http://localhost:4000',
         changeOrigin: true,
-        // keep the /api prefix so routes match server.js
-        // (if your server mounted at root)
+        // strip the /api prefix when proxying to the API
+        rewrite: (path) => path.replace(/^\/api/, ''),
       },
     },
   },
