@@ -4,32 +4,26 @@ import express from 'express';
 import cors from 'cors';
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-// Optional deps (don’t crash if missing)
+// ---------- Optional deps (don’t crash if missing) ----------
 let compression = null;
 let morgan = null;
-try { ({ default: compression } = await import('compression')); } catch { console.warn('[warn] no compression'); }
-try { ({ default: morgan } = await import('morgan')); } catch { console.warn('[warn] no morgan'); }
+try {
+  ({ default: compression } = await import('compression'));
+} catch {
+  console.warn('[warn] compression not installed');
+}
+try {
+  ({ default: morgan } = await import('morgan'));
+} catch {
+  console.warn('[warn] morgan not installed');
+}
 
-// AWS SDK v3 (DynamoDB)
+// ---------- AWS SDK v3 (DynamoDB) ----------
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
-import crypto from 'node:crypto';
-app.post('/auth/guest', (req, res) => {
-  const id = crypto.randomUUID();
-  const token = `guest-${id}`;
-  res.json({ token, userId: id });
-});
-
-async function requireAuth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  if (!token.startsWith('guest-')) return res.status(401).json({ error: 'Missing or invalid token' });
-  // attach user info
-  req.user = { uid: token.replace('guest-', '') };
-  return next();
-}
 
 // ---------- ENV ----------
 /*
@@ -46,7 +40,7 @@ const PORT = Number(process.env.PORT || 4000);
 const AWS_REGION = process.env.AWS_REGION || 'us-west-2';
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',')
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 const WEB_DIST_DIR = process.env.WEB_DIST_DIR || '/opt/StoriBloom/web-dist';
 const TABLE_CODES = process.env.TABLE_CODES || 'storibloom_codes';
@@ -62,17 +56,18 @@ const __dirname = path.dirname(__filename);
 
 // ---------- App ----------
 const app = express();
-app.set('trust proxy', true); // behind nginx
+app.set('trust proxy', true); // behind nginx / render
+app.disable('x-powered-by'); // reduce header noise
 
-// DO NOT set COOP/COEP here (causes warnings on HTTP)
-app.disable('x-powered-by');
-
-// CORS
+// ---------- CORS ----------
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // curl / same-origin
+      // allow curl/same-origin
+      if (!origin) return cb(null, true);
+      // allow all if none specified
       if (CORS_ORIGINS.length === 0) return cb(null, true);
+      // allow exact matches
       if (CORS_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
@@ -83,50 +78,58 @@ app.use(
 );
 app.options('*', cors());
 
-// JSON body
+// ---------- Body parsing ----------
 app.use(express.json({ limit: '1mb' }));
 
-// guest login: issues a simple UID + opaque token the frontend can use in x-user-id / x-guest-token
-app.post('/auth/guest', (req, res) => {
-  try {
-    const uid = 'guest_' + Math.random().toString(36).slice(2, 10);
-    const token = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-    res.json({ uid, token });
-  } catch (e) {
-    console.error('guest auth error', e);
-    res.status(500).json({ error: 'guest auth failed' });
-  }
-});
-
-
-// Optional middleware
+// ---------- Optional middleware ----------
 if (compression) app.use(compression());
 if (morgan) app.use(morgan('tiny'));
 
-// Tiny logger
+// ---------- Tiny logger (after morgan so it doesn’t duplicate) ----------
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
 });
 
-// ---------- Auth ----------
+// ---------- Auth Helpers ----------
 /**
- * Accepts:
- *  - Authorization: Bearer <token>  (exposed as req.userToken)
- *  - x-user-id: <uid>               (exposed as req.user.uid)
+ * Simple guest token issuer.
+ * Response: { token: "guest-<uuid>", userId: "<uuid>" }
+ * Usage on client: send "Authorization: Bearer guest-<uuid>"
  */
-/**function requireAuth(req, res, next) {
-  const hdr = req.headers.authorization || '';
-  const bearer = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
-  const uid = req.headers['x-user-id'] ? String(req.headers['x-user-id']) : null;
-
-  if (!bearer && !uid) {
-    return res.status(401).json({ error: 'Missing Authorization or x-user-id' });
+app.post('/auth/guest', (_req, res) => {
+  try {
+    const id = crypto.randomUUID();
+    const token = `guest-${id}`;
+    res.json({ token, userId: id });
+  } catch (e) {
+    console.error('[auth/guest] error:', e);
+    res.status(500).json({ error: 'guest auth failed' });
   }
-  req.user = { uid: uid || null };
-  req.userToken = bearer || null;
-  next();
-}*/
+});
+
+/**
+ * Middleware requires:
+ *   Authorization: Bearer guest-<uuid>
+ * Attaches: req.user = { uid }
+ */
+async function requireAuth(req, res, next) {
+  try {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    if (!token || !token.startsWith('guest-')) {
+      return res.status(401).json({ error: 'Missing or invalid token' });
+    }
+    const uid = token.replace('guest-', '');
+    if (!uid) return res.status(401).json({ error: 'Invalid uid' });
+    req.user = { uid };
+    req.userToken = token;
+    return next();
+  } catch (err) {
+    console.error('[requireAuth] error:', err);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+}
 
 // ---------- Health / Version ----------
 app.get('/health', (_req, res) => {
@@ -150,7 +153,7 @@ app.get('/version', (_req, res) => {
  * Body: { code: "P-1234" | "U-ABCD" }
  * Table: TABLE_CODES (PK: code)
  * Returns: { siteId, role }
- * (Optional) If you store "consumed" flag, this will mark it consumed by uid if present.
+ * (Optional) marks consumed if attributes exist.
  */
 app.post('/codes/consume', requireAuth, async (req, res) => {
   try {
@@ -159,28 +162,31 @@ app.post('/codes/consume', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Missing code' });
     }
 
-    const getRes = await ddbDoc.send(new GetCommand({
-      TableName: TABLE_CODES,
-      Key: { code: code.trim() },
-    }));
+    const getRes = await ddbDoc.send(
+      new GetCommand({
+        TableName: TABLE_CODES,
+        Key: { code: code.trim() },
+      })
+    );
 
     const item = getRes.Item;
     if (!item) return res.status(404).json({ error: 'Code not found or invalid' });
 
-    // Optionally mark consumed (only if you put these attributes in your schema)
+    // Optionally mark consumed (ignore if attributes don’t exist)
     try {
-      await ddbDoc.send(new UpdateCommand({
-        TableName: TABLE_CODES,
-        Key: { code: item.code },
-        UpdateExpression: 'SET consumed = :c, usedBy = :u, consumedAt = :t',
-        ExpressionAttributeValues: {
-          ':c': true,
-          ':u': req.user.uid || '(unknown)',
-          ':t': Date.now(),
-        },
-      }));
+      await ddbDoc.send(
+        new UpdateCommand({
+          TableName: TABLE_CODES,
+          Key: { code: item.code },
+          UpdateExpression: 'SET consumed = :c, usedBy = :u, consumedAt = :t',
+          ExpressionAttributeValues: {
+            ':c': true,
+            ':u': req.user.uid || '(unknown)',
+            ':t': Date.now(),
+          },
+        })
+      );
     } catch (e) {
-      // If attributes don’t exist in your table, ignore
       console.warn('[codes/consume] update skipped:', e?.message || e);
     }
 
@@ -194,7 +200,7 @@ app.post('/codes/consume', requireAuth, async (req, res) => {
   }
 });
 
-// ---------- Voting (placeholder stubs to avoid 404s) ----------
+// ---------- Voting (placeholder stubs) ----------
 app.get('/rooms/:roomId/vote', requireAuth, async (_req, res) => {
   res.json({ votingOpen: false, options: [], votesReceived: 0, counts: [] });
 });
@@ -211,39 +217,43 @@ app.post('/rooms/:roomId/vote/close', requireAuth, async (_req, res) => {
 });
 
 // ---------- Static Frontend (SPA) ----------
-// Serve both at "/" and "/app" so you can access either.
-// If WEB_DIST_DIR is missing, we fall back to simple API text.
-
 function hasIndex(dir) {
   try {
     return fs.existsSync(path.join(dir, 'index.html'));
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
-
 const distDir = WEB_DIST_DIR;
 const distHasIndex = hasIndex(distDir);
 
 // Serve assets if present
 if (distHasIndex) {
-  app.use('/assets', express.static(path.join(distDir, 'assets'), {
-    fallthrough: true,
-    index: false,
-    maxAge: '1h',
-  }));
-  app.use('/app/assets', express.static(path.join(distDir, 'assets'), {
-    fallthrough: true,
-    index: false,
-    maxAge: '1h',
-  }));
+  app.use(
+    '/assets',
+    express.static(path.join(distDir, 'assets'), {
+      fallthrough: true,
+      index: false,
+      maxAge: '1h',
+    })
+  );
+  app.use(
+    '/app/assets',
+    express.static(path.join(distDir, 'assets'), {
+      fallthrough: true,
+      index: false,
+      maxAge: '1h',
+    })
+  );
 }
 
 // Root – if SPA exists, serve it; else text
-app.get('/', (req, res) => {
+app.get('/', (_req, res) => {
   if (!ENABLE_SPA || !distHasIndex) {
     return res.status(200).send('StoriBloom API (DynamoDB) ✅');
   }
   const indexPath = path.join(distDir, 'index.html');
-  res.sendFile(indexPath, err => {
+  res.sendFile(indexPath, (err) => {
     if (err) {
       console.error('[static /] index error:', err?.message || err);
       res.status(404).send(`Error: index.html not found at '${indexPath}'`);
@@ -252,12 +262,12 @@ app.get('/', (req, res) => {
 });
 
 // Explicit /app entry (also SPA)
-app.get('/app', (req, res) => {
+app.get('/app', (_req, res) => {
   if (!ENABLE_SPA || !distHasIndex) {
     return res.status(200).send('StoriBloom API (DynamoDB) ✅');
   }
   const indexPath = path.join(distDir, 'index.html');
-  res.sendFile(indexPath, err => {
+  res.sendFile(indexPath, (err) => {
     if (err) {
       console.error('[static /app] index error:', err?.message || err);
       res.status(404).send(`Error: index.html not found at '${indexPath}'`);
@@ -267,9 +277,9 @@ app.get('/app', (req, res) => {
 
 // SPA fallback for deep links under /app and /
 if (ENABLE_SPA && distHasIndex) {
-  app.get(/^\/app\/(.*)/, (req, res) => {
+  app.get(/^\/app\/(.*)/, (_req, res) => {
     const indexPath = path.join(distDir, 'index.html');
-    res.sendFile(indexPath, err => {
+    res.sendFile(indexPath, (err) => {
       if (err) {
         console.error('[static fallback /app/*] error:', err?.message || err);
         res.status(404).send(`Error: index.html not found at '${indexPath}'`);
@@ -277,13 +287,13 @@ if (ENABLE_SPA && distHasIndex) {
     });
   });
 
-  app.get(/^\/(?!api|health|version|rooms|codes|assets).*/, (req, res, next) => {
-    // Don’t hijack API paths; otherwise serve SPA
+  // Don't hijack API-like paths
+  app.get(/^\/(?!api|health|version|rooms|codes|assets).*/, (_req, res, next) => {
     const indexPath = path.join(distDir, 'index.html');
-    res.sendFile(indexPath, err => {
+    res.sendFile(indexPath, (err) => {
       if (err) {
         console.error('[static fallback /*] error:', err?.message || err);
-        next(); // fallback to 404 below
+        next(); // proceed to 404
       }
     });
   });
