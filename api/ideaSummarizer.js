@@ -1,102 +1,111 @@
 // api/ideaSummarizer.js
+// DynamoDB version: reads storibloom_messages by phase and writes ideaSummary/memoryNotes to storibloom_rooms.
 
+import {
+  DynamoDBClient,
+} from '@aws-sdk/client-dynamodb';
+import {
+  DynamoDBDocumentClient,
+  QueryCommand,
+  UpdateCommand,
+  GetCommand,
+} from '@aws-sdk/lib-dynamodb';
 import { personaSystemPrompt } from './asemaPersona.js';
-import { Rooms, Messages } from './ddbAdapter.js';
+import OpenAI from 'openai';
+
+const REGION = process.env.AWS_REGION || 'us-west-2';
+const TABLES = {
+  rooms: process.env.DDB_TABLE_ROOMS || 'storibloom_rooms',
+  messages: process.env.DDB_TABLE_MESSAGES || 'storibloom_messages',
+};
+
+const ddb = new DynamoDBClient({ region: REGION, ...(process.env.AWS_DYNAMO_ENDPOINT ? { endpoint: process.env.AWS_DYNAMO_ENDPOINT } : {}) });
+const ddbDoc = DynamoDBDocumentClient.from(ddb, { marshallOptions: { removeUndefinedValues: true } });
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 /**
- * Summarize ideas for a room and store both `ideaSummary` and `memoryNotes`.
- * Runs OpenAI once and writes results to the Rooms item in DynamoDB.
- *
- * @param {{ openai: import('openai').default, model?: string, temperature?: number }} deps
- * @param {string} roomId
- * @returns {Promise<{ok: boolean, reason?: string, summary?: string, empty?: boolean}>}
+ * Summarize ideas for a room and store both `ideaSummary` and `memoryNotes` in storibloom_rooms.
+ * It reads the room, pulls messages in the active idea phase, and writes back to the room row.
  */
-export async function summarizeIdeas(deps, roomId) {
-  const { openai, model = 'gpt-4o-mini', temperature = 0.4 } = deps || {};
-  if (!openai) return { ok: false, reason: 'missing_openai' };
-  if (!roomId) return { ok: false, reason: 'missing_roomId' };
-
-  // 1) Load room
-  const room = await Rooms.get(roomId);
+export async function summarizeIdeas(roomId) {
+  // Load room
+  const { Item: room } = await ddbDoc.send(new GetCommand({
+    TableName: TABLES.rooms,
+    Key: { roomId },
+  }));
   if (!room) return { ok: false, reason: 'room_not_found' };
 
-  const stage = String(room.stage || 'LOBBY').toUpperCase();
+  const stage = room.stage || 'LOBBY';
   if (stage !== 'DISCOVERY' && stage !== 'IDEA_DUMP') {
     return { ok: false, reason: 'wrong_stage' };
   }
 
-  // 2) Gather messages for current stage (ascending by createdAt)
-  const items = await Messages.byPhase(roomId, stage);
-  const texts = (items || [])
-    .filter((m) => {
-      const at = (m.authorType || '').toString().toUpperCase();
-      return at === 'USER'; // accept USER; if you stored 'user', normalize below
-    })
-    .map((m) => m.text)
-    .filter(Boolean);
+  // Gather human messages for this phase
+  // Assumes messages PK=roomId, SK=createdAt (Number), attributes {authorType, phase, text}
+  const { Items } = await ddbDoc.send(new QueryCommand({
+    TableName: TABLES.messages,
+    KeyConditionExpression: 'roomId = :r',
+    ExpressionAttributeValues: { ':r': roomId },
+    ScanIndexForward: true,
+  }));
+  const human = (Items || [])
+    .filter(m => (m.authorType === 'user') && (m.phase === stage) && typeof m.text === 'string')
+    .map(m => m.text)
+    .join('\n')
+    .trim();
 
-  // Fallback: if nothing matched USER (uppercase), try 'user' (lowercase) to be tolerant
-  const humanJoined =
-    texts.length > 0
-      ? texts.join('\n')
-      : (items || [])
-          .filter((m) => (m.authorType || '').toString().toLowerCase() === 'user')
-          .map((m) => m.text)
-          .filter(Boolean)
-          .join('\n');
-
-  // 3) Nothing to summarize → clear summary & set timestamp
-  if (!humanJoined || !humanJoined.trim()) {
-    await Rooms.update(roomId, {
-      ideaSummary: '',
-      lastIdeaSummaryAt: Date.now(),
-    });
+  if (!human) {
+    await ddbDoc.send(new UpdateCommand({
+      TableName: TABLES.rooms,
+      Key: { roomId },
+      UpdateExpression: 'SET ideaSummary = :s, lastIdeaSummaryAt = :t',
+      ExpressionAttributeValues: {
+        ':s': '',
+        ':t': Date.now(),
+      },
+    }));
     return { ok: true, empty: true };
   }
 
-  // 4) Build system prompt and call OpenAI
   const system = personaSystemPrompt({ roomTopic: room.topic });
 
-  let completionText = '';
-  try {
-    const completion = await openai.chat.completions.create({
-      model,
-      temperature,
-      max_tokens: 260,
-      messages: [
-        { role: 'system', content: system },
-        {
-          role: 'user',
-          content:
-            `Summarize key ideas so far as tight bullets (themes, characters, conflicts, settings, constraints).` +
-            ` Keep it brief and specific.\n\n` +
-            humanJoined,
-        },
-      ],
-    });
-
-    completionText =
-      completion?.choices?.[0]?.message?.content?.trim() || '';
-  } catch (err) {
-    console.error('[ideaSummarizer] OpenAI error:', err);
-    return { ok: false, reason: 'openai_error' };
-  }
-
-  // 5) Extract bullet notes, normalize, dedupe with existing memory
-  const newNotes = completionText
-    .split('\n')
-    .map((s) => s.replace(/^[-•]\s?/, '').trim())
-    .filter(Boolean);
-
-  const existing = Array.isArray(room.memoryNotes) ? room.memoryNotes : [];
-  const memory = Array.from(new Set([...existing, ...newNotes]));
-
-  // 6) Persist to Rooms (single write)
-  await Rooms.update(roomId, {
-    ideaSummary: completionText,
-    memoryNotes: memory,
-    lastIdeaSummaryAt: Date.now(),
+  const completion = await openai.chat.completions.create({
+    model: MODEL,
+    temperature: 0.4,
+    max_tokens: 260,
+    messages: [
+      { role: 'system', content: system },
+      {
+        role: 'user',
+        content:
+          `Summarize key ideas so far as tight bullets (themes, characters, conflicts, settings, constraints). Keep it brief and specific.\n\n` +
+          human,
+      },
+    ],
   });
 
-  return { ok: true, summary: completionText };
+  const summary = completion.choices?.[0]?.message?.content?.trim() || '';
+  const newNotes = summary
+    .split('\n')
+    .map(s => s.replace(/^[-•]\s?/, '').trim())
+    .filter(Boolean);
+
+  // merge memoryNotes unique
+  const memorySet = new Set([...(room.memoryNotes || []), ...newNotes]);
+  const memoryNotes = Array.from(memorySet);
+
+  await ddbDoc.send(new UpdateCommand({
+    TableName: TABLES.rooms,
+    Key: { roomId },
+    UpdateExpression: 'SET ideaSummary = :sum, memoryNotes = :mem, lastIdeaSummaryAt = :t',
+    ExpressionAttributeValues: {
+      ':sum': summary,
+      ':mem': memoryNotes,
+      ':t': Date.now(),
+    },
+  }));
+
+  return { ok: true, summary };
 }
