@@ -115,7 +115,7 @@ app.use((req, _res, next) => {
  *  - Authorization: Bearer <token>  (exposed as req.userToken)
  *  - x-user-id: <uid>               (exposed as req.user.uid)
  */
-function requireAuth(req, res, next) {
+/**function requireAuth(req, res, next) {
   const hdr = req.headers.authorization || '';
   const bearer = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
   const uid = req.headers['x-user-id'] ? String(req.headers['x-user-id']) : null;
@@ -126,7 +126,7 @@ function requireAuth(req, res, next) {
   req.user = { uid: uid || null };
   req.userToken = bearer || null;
   next();
-}
+}*/
 
 // ---------- Health / Version ----------
 app.get('/health', (_req, res) => {
