@@ -1,33 +1,42 @@
+// web/src/components/PresenterHUD.jsx
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { awsHeaders } from '../lib/awsAuth';
+import { authHeaders, API_BASE } from '../api.js';
 
 export default function PresenterHUD({ siteId, rooms }) {
-  const sorted = useMemo(() =>
-    [...(rooms || [])].sort((a, b) => (a.index || 0) - (b.index || 0))
-  , [rooms]);
+  const sorted = useMemo(
+    () => [...(rooms || [])].sort((a, b) => (a.index || 0) - (b.index || 0)),
+    [rooms]
+  );
 
   const [open, setOpen] = useState(true);
   const [helpOpen, setHelpOpen] = useState(false);
   const [i, setI] = useState(0); // selected room index in sorted
   const room = sorted[i];
 
-  const post = useCallback(async (path, body) => {
-    if (!room) return;
-    const url = `${import.meta.env.VITE_API_URL}${path.replace(':roomId', room.id)}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      ...(await awsHeaders()),
-      body: JSON.stringify(body || {})
-    });
-    if (!res.ok) {
-      const j = await res.json().catch(()=>({}));
-      alert(j.error || 'Action failed');
-    }
-  }, [room]);
+  const post = useCallback(
+    async (path, body) => {
+      if (!room) return;
+      try {
+        const url = `${API_BASE}${path.replace(':roomId', encodeURIComponent(room.id))}`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: await authHeaders(),
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          throw new Error(j.error || 'Action failed');
+        }
+      } catch (err) {
+        alert(err.message || 'Action failed');
+      }
+    },
+    [room]
+  );
 
-  const next = useCallback(()=> post(`/rooms/:roomId/next`, {}), [post]);
-  const extend = useCallback(()=> post(`/rooms/:roomId/extend`, { by: 120 }), [post]);
-  const redo = useCallback(()=> post(`/rooms/:roomId/redo`, {}), [post]);
+  const next = useCallback(() => post(`/rooms/:roomId/next`, {}), [post]);
+  const extend = useCallback(() => post(`/rooms/:roomId/extend`, { by: 120 }), [post]);
+  const redo = useCallback(() => post(`/rooms/:roomId/redo`, {}), [post]);
 
   // hotkeys
   useEffect(() => {
@@ -36,26 +45,43 @@ export default function PresenterHUD({ siteId, rooms }) {
       const tag = (e.target?.tagName || '').toLowerCase();
       if (tag === 'input' || tag === 'textarea' || e.isComposing) return;
 
-      if (e.key === 'h' || e.key === 'H') { setOpen(o=>!o); return; }
-      if (e.key === '?') { setHelpOpen(h=>!h); return; }
+      if (e.key === 'h' || e.key === 'H') {
+        setOpen((o) => !o);
+        return;
+      }
+      if (e.key === '?') {
+        setHelpOpen((h) => !h);
+        return;
+      }
 
-      if (!open) return;
+      if (!open || !room) return;
 
-      if (e.key === 'n' || e.key === 'N') { e.preventDefault(); next(); }
-      if (e.key === 'e' || e.key === 'E') { e.preventDefault(); extend(); }
-      if (e.key === 'r' || e.key === 'R') { e.preventDefault(); redo(); }
+      if (e.key === 'n' || e.key === 'N') {
+        e.preventDefault();
+        next();
+      }
+      if (e.key === 'e' || e.key === 'E') {
+        e.preventDefault();
+        extend();
+      }
+      if (e.key === 'r' || e.key === 'R') {
+        e.preventDefault();
+        redo();
+      }
 
       // change selected room
       if (e.key === '[' || ((e.ctrlKey || e.metaKey) && e.key === 'ArrowUp')) {
-        e.preventDefault(); setI((p)=> Math.max(0, p-1));
+        e.preventDefault();
+        setI((p) => Math.max(0, p - 1));
       }
       if (e.key === ']' || ((e.ctrlKey || e.metaKey) && e.key === 'ArrowDown')) {
-        e.preventDefault(); setI((p)=> Math.min(sorted.length-1, p+1));
+        e.preventDefault();
+        setI((p) => Math.min(sorted.length - 1, p + 1));
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [open, sorted.length, next, extend, redo]);
+  }, [open, sorted.length, next, extend, redo, room]);
 
   if (!room) return null;
 
@@ -86,7 +112,7 @@ export default function PresenterHUD({ siteId, rooms }) {
           <div className="hud-pill">Room <b>{room.index}</b></div>
           <div className="hud-pill">Stage <b>{room.stage}</b></div>
           <div className="hud-pill" style={{ marginLeft: 'auto' }}>
-            {i+1}/{sorted.length}
+            {i + 1}/{sorted.length}
           </div>
         </div>
 

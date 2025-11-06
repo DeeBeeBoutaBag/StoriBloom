@@ -1,15 +1,27 @@
 {
-  "name": "storibloom-scripts",
+  "name": "asemacollab-lite",
   "private": true,
   "type": "module",
-  "scripts": {
-    "seed:dynamo": "node scripts/seedDynamo.mjs",
-    "dump:dynamo": "node scripts/dumpDynamo.mjs"
+  "engines": {
+    "node": ">=20 <21"
   },
-  "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.922.0",
-    "@aws-sdk/lib-dynamodb": "^3.922.0",
-    "compression": "^1.8.1",
-    "yargs": "^17.7.2"
+  "workspaces": [
+    "api",
+    "web"
+  ],
+  "scripts": {
+    "dev:api": "npm --workspace api run dev",
+    "dev:web": "npm --workspace web run dev",
+    "dev": "npm run dev:api & npm run dev:web",
+
+    "build:web": "npm --workspace web run build",
+    "build": "npm run build:web",
+
+    "start:api": "npm --workspace api run start",
+
+    "//": "---- Render convenience scripts (optional; set these as service commands on Render) ----",
+    "render:build:web": "npm ci --workspace web && npm run build --workspace web",
+    "render:build:api": "npm ci --workspace api",
+    "render:start:api": "npm run start --workspace api"
   }
 }

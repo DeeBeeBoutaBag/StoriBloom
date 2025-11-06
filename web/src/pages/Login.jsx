@@ -1,7 +1,9 @@
+// web/src/pages/Login.jsx
+
 import React, { useState, useRef } from 'react';
 import { motion, useMotionValue, useTransform } from 'framer-motion';
 import EmojiDrawer from '../components/EmojiDrawer.jsx';
-import { ensureGuest, bearer as bearerHeaders, API_BASE } from '../api';
+import { ensureGuest, authHeaders, API_BASE } from '../api.js';
 
 export default function Login() {
   const [code, setCode] = useState('');
@@ -36,13 +38,13 @@ export default function Login() {
     try {
       setBusy(true);
 
-      // Ensure we have a guest JWT from the API (stored by ensureGuest)
+      // Ensure guest token exists
       await ensureGuest();
 
-      // Consume code at AWS API
+      // Consume code via API (uses Authorization: Bearer <token>)
       const res = await fetch(`${API_BASE}/codes/consume`, {
         method: 'POST',
-        ...(await awsHeaders()),
+        headers: await authHeaders(),
         body: JSON.stringify({ code: trimmed }),
       });
 
@@ -53,20 +55,31 @@ export default function Login() {
         return;
       }
 
-      // Presenter or Participant route
+      // Route based on role
       if (json.role === 'PRESENTER') {
-        // Presenter goes to HUD (they’ll input siteId there)
-        location.href = `/presenter`;
+        // Your router expects /presenter/:siteId
+        if (!json.siteId) {
+          alert('Missing siteId for presenter.');
+          setBusy(false);
+          return;
+        }
+        location.href = `/presenter/${json.siteId}`;
       } else {
         const personas = mode === 'pair' ? [emoji1, emoji2] : [emoji1];
         sessionStorage.setItem('personas', JSON.stringify(personas));
         sessionStorage.setItem('mode', mode);
-        // For demo we route to room 1 of the site; server can later assign
+
+        // Demo route: /room/<siteId>-1 (can change when server assigns exact room)
+        if (!json.siteId) {
+          alert('Missing siteId.');
+          setBusy(false);
+          return;
+        }
         location.href = `/room/${json.siteId}-1`;
       }
     } catch (e) {
       console.error(e);
-      alert('Could not reach API. Check your API_BASE and CORS.');
+      alert('Could not reach API. Check your API proxy/rewrites.');
     } finally {
       setBusy(false);
     }

@@ -1,11 +1,13 @@
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+// api/ddbClient.js
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
-const client = new DynamoDBClient({
-  region: process.env.AWS_REGION || "us-west-2",
-});
-export const ddb = DynamoDBDocumentClient.from(client, {
-  marshallOptions: { removeUndefinedValues: true, convertClassInstanceToMap: true },
-  unmarshallOptions: { wrapNumbers: false },
-});
+const REGION = process.env.AWS_REGION || 'us-west-2';
 
+// Native client
+const ddbNative = new DynamoDBClient({ region: REGION });
+
+// Document client (auto-marshals JS <-> DynamoDB)
+export const ddb = DynamoDBDocumentClient.from(ddbNative, {
+  marshallOptions: { removeUndefinedValues: true },
+});

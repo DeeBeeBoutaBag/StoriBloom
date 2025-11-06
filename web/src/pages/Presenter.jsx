@@ -1,31 +1,50 @@
+// web/src/pages/Presenter.jsx
+
 import React, { useEffect, useMemo, useState } from 'react';
-import { ensureGuest, bearer as bearerHeaders, API_BASE } from '../api';
+import { useParams } from 'react-router-dom';
+import { ensureGuest, authHeaders, API_BASE } from '../api.js';
 
 /**
  * Presenter HUD
- * - Enter your Site ID (persisted in sessionStorage)
+ * - Enter your Site ID (persisted in sessionStorage, seeded from URL param)
  * - Lists rooms for that site
  * - Controls per-room: Next, +2m, Redo, Lock/Unlock input
  * - Voting controls (Start, Close/Lock)
  * - Live status: stage, seats, topic, inputLocked, vote status
  */
 
-function useSiteId() {
-  const [siteId, setSiteId] = useState(() => sessionStorage.getItem('presenter_siteId') || '');
-  useEffect(() => { sessionStorage.setItem('presenter_siteId', siteId); }, [siteId]);
+function useSiteIdFromUrl() {
+  const { siteId: siteIdParam } = useParams();
+  const [siteId, setSiteId] = useState(() => {
+    // Prefer URL param on first load, then fall back to sessionStorage
+    const fromUrl = (siteIdParam || '').toUpperCase();
+    if (fromUrl) {
+      sessionStorage.setItem('presenter_siteId', fromUrl);
+      return fromUrl;
+    }
+    return (sessionStorage.getItem('presenter_siteId') || '').toUpperCase();
+  });
+
+  // Persist on changes typed by the user
+  useEffect(() => {
+    sessionStorage.setItem('presenter_siteId', siteId.toUpperCase());
+  }, [siteId]);
+
   return [siteId, setSiteId];
 }
 
 export default function Presenter() {
-  const [siteId, setSiteId] = useSiteId();
+  const [siteId, setSiteId] = useSiteIdFromUrl();
   const [rooms, setRooms] = useState([]); // [{id, index, stage, inputLocked, topic, seats, vote:{open,total}}]
   const [loading, setLoading] = useState(false);
-  const [tick, setTick] = useState(0);
 
-  const canFetch = useMemo(() => !!siteId && /^[A-Z]\d$/.test(siteId) || siteId.length >= 1, [siteId]);
+  // Require a non-empty siteId to fetch
+  const canFetch = useMemo(() => !!(siteId && siteId.trim().length), [siteId]);
 
-  // auth bootstrap
-  useEffect(() => { ensureGuest(); }, []);
+  // auth bootstrap (get a guest token once)
+  useEffect(() => {
+    ensureGuest().catch(() => {});
+  }, []);
 
   // polling rooms list
   useEffect(() => {
@@ -35,14 +54,19 @@ export default function Presenter() {
     async function load() {
       setLoading(true);
       try {
-        const url = new URL(`${API_BASE}/presenter/rooms`);
-        url.searchParams.set('siteId', siteId);
-        const res = await fetch(url, await bearerHeaders());
+        const url = new URL(`${API_BASE}/presenter/rooms`, window.location.origin);
+        url.searchParams.set('siteId', siteId.toUpperCase());
+
+        const res = await fetch(url.toString(), {
+          headers: await authHeaders(),
+        });
         if (!res.ok) throw new Error('rooms fetch failed');
+
         const j = await res.json();
         if (!mounted) return;
         setRooms(Array.isArray(j.rooms) ? j.rooms : []);
-      } catch {
+      } catch (err) {
+        console.error('[Presenter] rooms load error:', err);
         if (mounted) setRooms([]);
       } finally {
         if (mounted) setLoading(false);
@@ -50,24 +74,26 @@ export default function Presenter() {
     }
 
     load();
-    const id = setInterval(() => { setTick(x => x + 1); load(); }, 2500);
-    return () => { mounted = false; clearInterval(id); };
+    const id = setInterval(load, 2500);
+    return () => {
+      mounted = false;
+      clearInterval(id);
+    };
   }, [siteId, canFetch]);
 
   async function post(path, body) {
     const res = await fetch(`${API_BASE}${path}`, {
       method: 'POST',
-      ...(await bearerHeaders()),
+      headers: await authHeaders(),
       body: body ? JSON.stringify(body) : undefined,
     });
     return res.ok;
   }
 
-  // hotkeys: Next (N), +2m (=), Redo (R)
+  // hotkeys: Next (N), +2m (= or +), Redo (R)
   useEffect(() => {
     function onKey(e) {
       if (!rooms.length) return;
-      // target = first room without SUBMITTED/CLOSED? Or just room 1:
       const r = rooms[0];
       if (!r) return;
 
@@ -124,7 +150,7 @@ export default function Presenter() {
           </div>
         </div>
 
-        {(!canFetch) && (
+        {!canFetch && (
           <div className="empty glass">
             Enter a Site ID to load rooms.
           </div>
@@ -137,7 +163,9 @@ export default function Presenter() {
               <div key={r.id} className="room-card glass">
                 <div className="head">
                   <div className="id">Room {r.index}</div>
-                  <div className={`stage badge ${r.stage?.toLowerCase() || 'unknown'}`}>{r.stage || '—'}</div>
+                  <div className={`stage badge ${r.stage?.toLowerCase() || 'unknown'}`}>
+                    {r.stage || '—'}
+                  </div>
                 </div>
 
                 <div className="meta">
@@ -155,7 +183,7 @@ export default function Presenter() {
                       <details>
                         <summary>Tallies</summary>
                         <ul className="mini">
-                          {Object.entries(r.vote.tallies).map(([k,v]) => (
+                          {Object.entries(r.vote.tallies).map(([k, v]) => (
                             <li key={k}>#{k}: {v}</li>
                           ))}
                         </ul>
@@ -175,14 +203,14 @@ export default function Presenter() {
                 {/* Voting controls (usually used in DISCOVERY) */}
                 <div className="controls">
                   <button onClick={() => startVote(r.id)}>Start Voting</button>
-                  <button onClick={() => closeVote(r.id)} className="warn">Close & Lock Topic</button>
+                  <button onClick={() => closeVote(r.id)} className="warn">Close &amp; Lock Topic</button>
                 </div>
               </div>
             ))}
 
             {!loading && rooms.length === 0 && (
               <div className="empty glass">
-                No rooms returned for site <b>{siteId}</b>.
+                No rooms returned for site <b>{siteId}</b>.<br />
                 Ensure your API endpoint <code>/presenter/rooms?siteId=...</code> is implemented.
               </div>
             )}

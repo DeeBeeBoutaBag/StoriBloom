@@ -1,69 +1,102 @@
+// api/ideaSummarizer.js
+
 import { personaSystemPrompt } from './asemaPersona.js';
+import { Rooms, Messages } from './ddbAdapter.js';
 
 /**
  * Summarize ideas for a room and store both `ideaSummary` and `memoryNotes`.
- * Runs OpenAI once and writes results to Firestore.
+ * Runs OpenAI once and writes results to the Rooms item in DynamoDB.
+ *
+ * @param {{ openai: import('openai').default, model?: string, temperature?: number }} deps
+ * @param {string} roomId
+ * @returns {Promise<{ok: boolean, reason?: string, summary?: string, empty?: boolean}>}
  */
-export async function summarizeIdeas({ db, openai }, roomId) {
-  // load room
-  const roomRef = db.collection('rooms').doc(roomId);
-  const roomDoc = await roomRef.get();
-  if (!roomDoc.exists) return { ok: false, reason: 'room_not_found' };
+export async function summarizeIdeas(deps, roomId) {
+  const { openai, model = 'gpt-4o-mini', temperature = 0.4 } = deps || {};
+  if (!openai) return { ok: false, reason: 'missing_openai' };
+  if (!roomId) return { ok: false, reason: 'missing_roomId' };
 
-  const room = roomDoc.data();
-  const stage = room.stage || 'LOBBY';
+  // 1) Load room
+  const room = await Rooms.get(roomId);
+  if (!room) return { ok: false, reason: 'room_not_found' };
+
+  const stage = String(room.stage || 'LOBBY').toUpperCase();
   if (stage !== 'DISCOVERY' && stage !== 'IDEA_DUMP') {
     return { ok: false, reason: 'wrong_stage' };
   }
 
-  // gather messages for current stage
-  const msgsSnap = await roomRef.collection('messages')
-    .where('phase', '==', stage)
-    .orderBy('createdAt', 'asc')
-    .get();
+  // 2) Gather messages for current stage (ascending by createdAt)
+  const items = await Messages.byPhase(roomId, stage);
+  const texts = (items || [])
+    .filter((m) => {
+      const at = (m.authorType || '').toString().toUpperCase();
+      return at === 'USER'; // accept USER; if you stored 'user', normalize below
+    })
+    .map((m) => m.text)
+    .filter(Boolean);
 
-  const human = msgsSnap.docs
-    .map(d => d.data())
-    .filter(m => m.authorType === 'user')
-    .map(m => m.text)
-    .join('\n');
+  // Fallback: if nothing matched USER (uppercase), try 'user' (lowercase) to be tolerant
+  const humanJoined =
+    texts.length > 0
+      ? texts.join('\n')
+      : (items || [])
+          .filter((m) => (m.authorType || '').toString().toLowerCase() === 'user')
+          .map((m) => m.text)
+          .filter(Boolean)
+          .join('\n');
 
-  // nothing to summarize
-  if (!human.trim()) {
-    await roomRef.update({ ideaSummary: '', lastIdeaSummaryAt: new Date() });
+  // 3) Nothing to summarize → clear summary & set timestamp
+  if (!humanJoined || !humanJoined.trim()) {
+    await Rooms.update(roomId, {
+      ideaSummary: '',
+      lastIdeaSummaryAt: Date.now(),
+    });
     return { ok: true, empty: true };
   }
 
+  // 4) Build system prompt and call OpenAI
   const system = personaSystemPrompt({ roomTopic: room.topic });
-  const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.4,
-    max_tokens: 260,
-    messages: [
-      { role: 'system', content: system },
-      {
-        role: 'user',
-        content:
-          `Summarize key ideas so far as tight bullets (themes, characters, conflicts, settings, constraints).` +
-          ` Keep it brief and specific.\n\n` + human
-      }
-    ]
-  });
 
-  const summary = completion.choices?.[0]?.message?.content?.trim() || '';
-  const newNotes = summary
+  let completionText = '';
+  try {
+    const completion = await openai.chat.completions.create({
+      model,
+      temperature,
+      max_tokens: 260,
+      messages: [
+        { role: 'system', content: system },
+        {
+          role: 'user',
+          content:
+            `Summarize key ideas so far as tight bullets (themes, characters, conflicts, settings, constraints).` +
+            ` Keep it brief and specific.\n\n` +
+            humanJoined,
+        },
+      ],
+    });
+
+    completionText =
+      completion?.choices?.[0]?.message?.content?.trim() || '';
+  } catch (err) {
+    console.error('[ideaSummarizer] OpenAI error:', err);
+    return { ok: false, reason: 'openai_error' };
+  }
+
+  // 5) Extract bullet notes, normalize, dedupe with existing memory
+  const newNotes = completionText
     .split('\n')
-    .map(s => s.replace(/^[-•]\s?/, '').trim())
+    .map((s) => s.replace(/^[-•]\s?/, '').trim())
     .filter(Boolean);
 
-  // merge into memoryNotes (dedupe)
-  const memory = Array.from(new Set([...(room.memoryNotes || []), ...newNotes]));
+  const existing = Array.isArray(room.memoryNotes) ? room.memoryNotes : [];
+  const memory = Array.from(new Set([...existing, ...newNotes]));
 
-  await roomRef.update({
-    ideaSummary: summary,
+  // 6) Persist to Rooms (single write)
+  await Rooms.update(roomId, {
+    ideaSummary: completionText,
     memoryNotes: memory,
-    lastIdeaSummaryAt: new Date()
+    lastIdeaSummaryAt: Date.now(),
   });
 
-  return { ok: true, summary };
+  return { ok: true, summary: completionText };
 }

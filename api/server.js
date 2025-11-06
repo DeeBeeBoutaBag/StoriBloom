@@ -27,14 +27,14 @@ import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-
 
 // ---------- ENV ----------
 /*
-Example .env:
+Example .env (local dev only; use Render env vars in prod):
 
 PORT=4000
 AWS_REGION=us-west-2
-CORS_ORIGINS=http://localhost:5173,http://ec2-54-187-77-195.us-west-2.compute.amazonaws.com:4000
+CORS_ORIGINS=http://localhost:5173
 WEB_DIST_DIR=/opt/StoriBloom/web-dist
 TABLE_CODES=storibloom_codes
-STATIC_INDEX=1
+STATIC_INDEX=0
 */
 const PORT = Number(process.env.PORT || 4000);
 const AWS_REGION = process.env.AWS_REGION || 'us-west-2';
@@ -44,7 +44,8 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .filter(Boolean);
 const WEB_DIST_DIR = process.env.WEB_DIST_DIR || '/opt/StoriBloom/web-dist';
 const TABLE_CODES = process.env.TABLE_CODES || 'storibloom_codes';
-const ENABLE_SPA = String(process.env.STATIC_INDEX || '1') === '1';
+// Default SPA serving OFF because frontend is on Render Static:
+const ENABLE_SPA = String(process.env.STATIC_INDEX || '0') === '1';
 
 // ---------- AWS ----------
 const ddb = new DynamoDBClient({ region: AWS_REGION });
@@ -56,18 +57,17 @@ const __dirname = path.dirname(__filename);
 
 // ---------- App ----------
 const app = express();
-app.set('trust proxy', true); // behind nginx / render
-app.disable('x-powered-by'); // reduce header noise
+app.set('trust proxy', true); // behind Render proxy
+app.disable('x-powered-by');
 
-// ---------- CORS ----------
+// ---------- CORS (optional) ----------
+// If you proxy /api/* from the Static Site to this API (recommended), you can leave CORS_ORIGINS empty.
+// If not proxying, set CORS_ORIGINS to your static site origin(s).
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow curl/same-origin
-      if (!origin) return cb(null, true);
-      // allow all if none specified
-      if (CORS_ORIGINS.length === 0) return cb(null, true);
-      // allow exact matches
+      if (!origin) return cb(null, true); // curl / same-origin / proxy rewrite
+      if (CORS_ORIGINS.length === 0) return cb(null, true); // allow all if unset
       if (CORS_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
@@ -85,7 +85,7 @@ app.use(express.json({ limit: '1mb' }));
 if (compression) app.use(compression());
 if (morgan) app.use(morgan('tiny'));
 
-// ---------- Tiny logger (after morgan so it doesn’t duplicate) ----------
+// ---------- Tiny logger ----------
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
@@ -133,6 +133,14 @@ async function requireAuth(req, res, next) {
 
 // ---------- Health / Version ----------
 app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    region: AWS_REGION,
+    time: new Date().toISOString(),
+  });
+});
+// Optional alias if you ever want /api/health without a proxy rewrite:
+app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
     region: AWS_REGION,
@@ -209,7 +217,8 @@ app.post('/rooms/:roomId/vote/start', requireAuth, async (_req, res) => {
 });
 app.post('/rooms/:roomId/vote/submit', requireAuth, async (req, res) => {
   const { choice } = req.body || {};
-  if (typeof choice !== 'number') return res.status(400).json({ error: 'choice must be a number' });
+  if (typeof choice !== 'number')
+    return res.status(400).json({ error: 'choice must be a number' });
   res.json({ ok: true });
 });
 app.post('/rooms/:roomId/vote/close', requireAuth, async (_req, res) => {
@@ -217,6 +226,8 @@ app.post('/rooms/:roomId/vote/close', requireAuth, async (_req, res) => {
 });
 
 // ---------- Static Frontend (SPA) ----------
+// You’re hosting the frontend on Render Static, so ENABLE_SPA is false by default.
+// These handlers remain in case you later choose to serve a build from this service.
 function hasIndex(dir) {
   try {
     return fs.existsSync(path.join(dir, 'index.html'));
@@ -315,7 +326,7 @@ app.use((err, _req, res, _next) => {
 
 // ---------- Listen ----------
 app.listen(PORT, () => {
-  console.log(`API listening on http://localhost:${PORT}`);
+  console.log(`API listening on 0.0.0.0:${PORT}`);
   console.log(`[env] region=${AWS_REGION}`);
   console.log(`[env] CORS_ORIGINS=${CORS_ORIGINS.length ? CORS_ORIGINS.join(',') : '(all)'}`);
   console.log(`[env] static dir=${distDir} (present=${distHasIndex}) SPA=${ENABLE_SPA}`);

@@ -1,8 +1,6 @@
 // web/src/hooks/useRoomVoting.js
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { awsHeaders } from '../lib/awsAuth';
-
-const API = import.meta.env.VITE_API_URL || '/api';
+import { authHeaders, API_BASE } from '../api.js';
 
 export function useRoomVoting(roomId) {
   const [status, setStatus] = useState({
@@ -15,15 +13,19 @@ export function useRoomVoting(roomId) {
   const pollRef = useRef(null);
 
   const fetchStatus = useCallback(async () => {
+    if (!roomId) return;
     try {
-      const res = await fetch(`${API}/rooms/${roomId}/vote`, { ...(await awsHeaders()) });
+      const res = await fetch(`${API_BASE}/rooms/${roomId}/vote`, {
+        method: 'GET',
+        headers: await authHeaders(),
+      });
       if (!res.ok) return;
       const json = await res.json();
       setStatus({
         votingOpen: !!json.votingOpen,
-        options: json.options || [],
+        options: Array.isArray(json.options) ? json.options : [],
         votesReceived: Number(json.votesReceived || 0),
-        counts: json.counts || [],
+        counts: Array.isArray(json.counts) ? json.counts : [],
       });
     } catch {
       // ignore transient errors
@@ -31,14 +33,15 @@ export function useRoomVoting(roomId) {
   }, [roomId]);
 
   const startVoting = useCallback(async () => {
+    if (!roomId) return false;
     setLoading(true);
     try {
-      const res = await fetch(`${API}/rooms/${roomId}/vote/start`, {
+      const res = await fetch(`${API_BASE}/rooms/${roomId}/vote/start`, {
         method: 'POST',
-        ...(await awsHeaders()),
+        headers: await authHeaders(),
       });
       if (!res.ok) {
-        const j = await res.json().catch(()=>({}));
+        const j = await res.json().catch(() => ({}));
         throw new Error(j.error || 'Failed to start voting');
       }
       await fetchStatus();
@@ -48,34 +51,39 @@ export function useRoomVoting(roomId) {
     }
   }, [roomId, fetchStatus]);
 
-  const submitVote = useCallback(async (choice) => {
-    setLoading(true);
-    try {
-      const res = await fetch(`${API}/rooms/${roomId}/vote/submit`, {
-        method: 'POST',
-        ...(await awsHeaders()),
-        body: JSON.stringify({ choice })
-      });
-      if (!res.ok) {
-        const j = await res.json().catch(()=>({}));
-        throw new Error(j.error || 'Failed to submit vote');
+  const submitVote = useCallback(
+    async (choice) => {
+      if (!roomId) return false;
+      setLoading(true);
+      try {
+        const res = await fetch(`${API_BASE}/rooms/${roomId}/vote/submit`, {
+          method: 'POST',
+          headers: await authHeaders(),
+          body: JSON.stringify({ choice: Number(choice) }),
+        });
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          throw new Error(j.error || 'Failed to submit vote');
+        }
+        await fetchStatus();
+        return true;
+      } finally {
+        setLoading(false);
       }
-      await fetchStatus();
-      return true;
-    } finally {
-      setLoading(false);
-    }
-  }, [roomId, fetchStatus]);
+    },
+    [roomId, fetchStatus]
+  );
 
   const closeVoting = useCallback(async () => {
+    if (!roomId) return false;
     setLoading(true);
     try {
-      const res = await fetch(`${API}/rooms/${roomId}/vote/close`, {
+      const res = await fetch(`${API_BASE}/rooms/${roomId}/vote/close`, {
         method: 'POST',
-        ...(await awsHeaders()),
+        headers: await authHeaders(),
       });
       if (!res.ok) {
-        const j = await res.json().catch(()=>({}));
+        const j = await res.json().catch(() => ({}));
         throw new Error(j.error || 'Failed to close voting');
       }
       await fetchStatus();
@@ -89,7 +97,12 @@ export function useRoomVoting(roomId) {
     fetchStatus();
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(fetchStatus, 2000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
   }, [fetchStatus]);
 
   return { status, loading, startVoting, submitVote, closeVoting, refresh: fetchStatus };
