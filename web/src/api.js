@@ -1,31 +1,37 @@
 // web/src/api.js
-
 const API_BASE = import.meta.env.VITE_API_BASE || '/api';
-const TOKEN_KEY = 'guestToken';
 
-export { API_BASE };
+// Keep the name `bearer` for backwards-compat with your imports
+export async function bearer() {
+  const token = await ensureGuest();
+  return {
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+  };
+}
 
-/**
- * Get existing guest token or fetch a new one.
- * Stores token in sessionStorage.
- */
+// Same as bearer, but exported under a clearer name if you want to switch later
+export const authHeaders = bearer;
+
+// Issue or reuse a guest token from the API
 export async function ensureGuest() {
-  const existing = sessionStorage.getItem(TOKEN_KEY);
-  if (existing) return existing;
+  let token = sessionStorage.getItem('guest_token');
+  if (token) return token;
 
+  // GET or POST are fine; using POST to avoid caches
   const res = await fetch(`${API_BASE}/auth/guest`, { method: 'POST' });
-  if (!res.ok) throw new Error('guest auth failed');
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.json()).error || ''; } catch {}
+    throw new Error(detail || 'guest auth failed');
+  }
   const json = await res.json();
-  if (!json?.token) throw new Error('guest auth: no token');
-  sessionStorage.setItem(TOKEN_KEY, json.token);
+  if (!json?.token) throw new Error('guest auth failed');
+  sessionStorage.setItem('guest_token', json.token);
+  sessionStorage.setItem('guest_user_id', json.userId || '');
   return json.token;
 }
 
-/** Return headers with Authorization bearer + JSON content-type */
-export async function authHeaders() {
-  const token = await ensureGuest();
-  return {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${token}`,
-  };
-}
+export { API_BASE };
