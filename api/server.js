@@ -6,15 +6,13 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'; // top of file (you likely already have QueryCommand)
 
-// ---------- Optional deps (don’t crash if missing) ----------
+// Optional deps
 let compression = null;
 let morgan = null;
-try { ({ default: compression } = await import('compression')); } catch { console.warn('[warn] compression not installed'); }
-try { ({ default: morgan } = await import('morgan')); } catch { console.warn('[warn] morgan not installed'); }
+try { ({ default: compression } = await import('compression')); } catch {}
+try { ({ default: morgan } = await import('morgan')); } catch {}
 
-// ---------- AWS SDK v3 (DynamoDB) ----------
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
@@ -24,25 +22,11 @@ import {
   QueryCommand,
 } from '@aws-sdk/lib-dynamodb';
 
-// ---------- ENV ----------
-/*
-Example .env (local dev; use Render env vars in prod):
+import { getOpenAI } from './openaiClient.js';
+import { Asema } from './asemaPersona.js';
+import { createStageEngine } from './stageEngine.js';
 
-PORT=4000
-AWS_REGION=us-west-2
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-AWS_DYNAMO_ENDPOINT=http://localhost:8000   # optional (DynamoDB Local)
-CORS_ORIGINS=http://localhost:5173
-STATIC_INDEX=0
-# Tables (override if your names differ)
-DDB_TABLE_CODES=storibloom_codes
-DDB_TABLE_ROOMS=storibloom_rooms
-DDB_TABLE_MESSAGES=storibloom_messages
-DDB_TABLE_DRAFTS=storibloom_drafts
-DDB_TABLE_PERSONAS=storibloom_personas
-DDB_TABLE_SESSIONS=storibloom_sessions
-*/
+// ---------- ENV ----------
 const PORT = Number(process.env.PORT || 4000);
 const AWS_REGION = process.env.AWS_REGION || 'us-west-2';
 const AWS_DYNAMO_ENDPOINT = process.env.AWS_DYNAMO_ENDPOINT || undefined;
@@ -52,7 +36,6 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
-// We default to your table names if envs aren’t set:
 const TABLES = {
   codes: process.env.DDB_TABLE_CODES || process.env.TABLE_CODES || 'storibloom_codes',
   rooms: process.env.DDB_TABLE_ROOMS || 'storibloom_rooms',
@@ -62,7 +45,6 @@ const TABLES = {
   sessions: process.env.DDB_TABLE_SESSIONS || 'storibloom_sessions',
 };
 
-// Serving SPA from this service is OFF by default (you’re on Render Static)
 const WEB_DIST_DIR = process.env.WEB_DIST_DIR || '/opt/StoriBloom/web-dist';
 const ENABLE_SPA = String(process.env.STATIC_INDEX || '0') === '1';
 
@@ -71,18 +53,28 @@ const ddb = new DynamoDBClient({
   region: AWS_REGION,
   ...(AWS_DYNAMO_ENDPOINT ? { endpoint: AWS_DYNAMO_ENDPOINT } : {}),
 });
-const ddbDoc = DynamoDBDocumentClient.from(ddb, { marshallOptions: { removeUndefinedValues: true } });
+const ddbDoc = DynamoDBDocumentClient.from(ddb, {
+  marshallOptions: { removeUndefinedValues: true },
+});
 
-// Early logs (cred/region) to diagnose issues quickly
+// Log AWS + OpenAI
 (async () => {
   try {
     const creds = await ddb.config.credentials();
-    if (creds?.accessKeyId) console.log('[aws] Credentials resolved');
-    else console.error('[aws] No AWS credentials resolved');
+    if (creds?.accessKeyId) console.log('[aws] credentials resolved');
+    else console.warn('[aws] credentials not resolved');
   } catch (e) {
-    console.error('[aws] Failed resolving credentials:', e?.message || e);
+    console.warn('[aws] credentials error:', e?.message || e);
   }
-  console.log(`[aws] region=${AWS_REGION} endpoint=${AWS_DYNAMO_ENDPOINT || '(default)'} tables=${JSON.stringify(TABLES)}`);
+
+  try {
+    getOpenAI();
+    console.log('[openai] enabled');
+  } catch (e) {
+    console.warn('[openai] disabled:', e?.message || e);
+  }
+
+  console.log('[env] tables', TABLES);
 })();
 
 // ---------- Paths ----------
@@ -94,7 +86,7 @@ const app = express();
 app.set('trust proxy', true);
 app.disable('x-powered-by');
 
-// ---------- CORS ----------
+// CORS
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -108,84 +100,85 @@ app.use(
     credentials: true,
   })
 );
-app.options('*', cors());
 
-// ---------- Body parsing ----------
 app.use(express.json({ limit: '1mb' }));
-
-// ---------- Optional middleware ----------
 if (compression) app.use(compression());
 if (morgan) app.use(morgan('tiny'));
 
-// ---------- Tiny logger ----------
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
 });
 
-// ---------- Auth Helpers ----------
+// ---------- Auth ----------
 function handleGuestAuth(_req, res) {
   try {
     const id = crypto.randomUUID();
     const token = `guest-${id}`;
     res.json({ token, userId: id });
   } catch (e) {
-    console.error('[auth/guest] error:', e);
+    console.error('[auth/guest] error', e);
     res.status(500).json({ error: 'guest auth failed' });
   }
 }
 app.post('/auth/guest', handleGuestAuth);
-app.post('/api/auth/guest', handleGuestAuth); // alias if proxy doesn’t strip /api
+app.post('/api/auth/guest', handleGuestAuth);
 
 async function requireAuth(req, res, next) {
   try {
     const header = req.headers.authorization || '';
     const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-    if (!token || !token.startsWith('guest-')) {
+    if (!token?.startsWith('guest-')) {
       return res.status(401).json({ error: 'Missing or invalid token' });
     }
     const uid = token.replace('guest-', '');
     if (!uid) return res.status(401).json({ error: 'Invalid uid' });
     req.user = { uid };
     req.userToken = token;
-    return next();
+    next();
   } catch (err) {
-    console.error('[requireAuth] error:', err);
+    console.error('[requireAuth] error', err);
     return res.status(401).json({ error: 'Unauthorized' });
   }
 }
 
-// ---------- Health / Version ----------
-const healthPayload = () => ({ ok: true, region: AWS_REGION, time: new Date().toISOString() });
-app.get('/health', (_req, res) => res.json(healthPayload()));
-app.get('/api/health', (_req, res) => res.json(healthPayload())); // alias
-app.get('/version', (_req, res) => {
-  res.json({
-    commit: process.env.GIT_COMMIT || null,
-    build: process.env.BUILD_ID || null,
-    time: new Date().toISOString(),
-  });
-});
-
-// ---------- Helpers: Rooms / Messages / Drafts ----------
+// ---------- Helpers ----------
 const DEFAULT_STAGE = 'LOBBY';
-const ROOM_ORDER = ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','ROUGH_DRAFT','EDITING','FINAL','CLOSED'];
+const ROOM_ORDER = [
+  'LOBBY',
+  'DISCOVERY',
+  'IDEA_DUMP',
+  'PLANNING',
+  'ROUGH_DRAFT',
+  'EDITING',
+  'FINAL',
+  'CLOSED',
+];
 
 function parseRoomId(roomId) {
   const [siteId, idxStr] = String(roomId).split('-');
   return { siteId: (siteId || 'E1').toUpperCase(), index: Number(idxStr || 1) };
 }
 
+function advanceStageVal(stage) {
+  const i = ROOM_ORDER.indexOf(stage || DEFAULT_STAGE);
+  return i >= 0 && i < ROOM_ORDER.length - 1
+    ? ROOM_ORDER[i + 1]
+    : (stage || DEFAULT_STAGE);
+}
+
 async function getRoom(roomId) {
-  const { Item } = await ddbDoc.send(new GetCommand({ TableName: TABLES.rooms, Key: { roomId } }));
+  const { Item } = await ddbDoc.send(
+    new GetCommand({ TableName: TABLES.rooms, Key: { roomId } })
+  );
   return Item || null;
 }
 
 async function ensureRoom(roomId) {
   let r = await getRoom(roomId);
   if (r) return r;
+
   const { siteId, index } = parseRoomId(roomId);
-  // Create with defaults
   r = {
     roomId,
     siteId,
@@ -197,31 +190,194 @@ async function ensureRoom(roomId) {
     ideaSummary: '',
     voteOpen: false,
     voteTotal: 0,
-    voteTallies: {}, // map num -> count
+    voteTallies: {},
+    greetedForStage: {},
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
-  await ddbDoc.send(new PutCommand({ TableName: TABLES.rooms, Item: r }));
+
+  await ddbDoc.send(
+    new PutCommand({ TableName: TABLES.rooms, Item: r })
+  );
   return r;
 }
 
 async function updateRoom(roomId, patch) {
-  const next = { ...(await getRoom(roomId)) || {}, roomId, ...patch, updatedAt: Date.now() };
-  await ddbDoc.send(new PutCommand({ TableName: TABLES.rooms, Item: next }));
+  const next = {
+    ...(await getRoom(roomId)) || {},
+    roomId,
+    ...patch,
+    updatedAt: Date.now(),
+  };
+  await ddbDoc.send(
+    new PutCommand({ TableName: TABLES.rooms, Item: next })
+  );
+  stageEngine.touch(roomId);
   return next;
 }
 
-function advanceStageVal(stage) {
-  const i = ROOM_ORDER.indexOf(stage || DEFAULT_STAGE);
-  return i >= 0 && i < ROOM_ORDER.length - 1 ? ROOM_ORDER[i + 1] : (stage || DEFAULT_STAGE);
+async function addMessage(
+  roomId,
+  { text, phase, authorType = 'user', personaIndex = 0, uid = null }
+) {
+  const createdAt = Date.now();
+  await ddbDoc.send(
+    new PutCommand({
+      TableName: TABLES.messages,
+      Item: {
+        roomId,
+        createdAt,
+        uid: uid || '(system)',
+        personaIndex,
+        authorType,
+        phase: phase || 'LOBBY',
+        text,
+      },
+    })
+  );
+  stageEngine.touch(roomId);
+  return { createdAt };
 }
 
-// ---------- Presenter: list rooms for a site ----------
+async function getMessagesForRoom(roomId, limit = 200) {
+  const { Items } = await ddbDoc.send(
+    new QueryCommand({
+      TableName: TABLES.messages,
+      KeyConditionExpression: 'roomId = :r',
+      ExpressionAttributeValues: { ':r': roomId },
+      ScanIndexForward: true,
+      Limit: Math.min(500, limit),
+    })
+  );
+  return Items || [];
+}
+
+// Draft helpers
+async function getLatestDraft(roomId) {
+  const { Items } = await ddbDoc.send(
+    new QueryCommand({
+      TableName: TABLES.drafts,
+      KeyConditionExpression: 'roomId = :r',
+      ExpressionAttributeValues: { ':r': roomId },
+      ScanIndexForward: false,
+      Limit: 1,
+    })
+  );
+  return (Items && Items[0]) || null;
+}
+
+async function generateRoughDraftForRoom(room, { force = false } = {}) {
+  if (!force) {
+    const existing = await getLatestDraft(room.roomId);
+    if (existing) return existing;
+  }
+
+  try {
+    const text = await Asema.generateRoughDraft(
+      room.topic || '',
+      room.ideaSummary || '',
+      room.roomId
+    );
+    const draft = (text || '').trim();
+    const createdAt = Date.now();
+
+    await ddbDoc.send(
+      new PutCommand({
+        TableName: TABLES.drafts,
+        Item: {
+          roomId: room.roomId,
+          createdAt,
+          content: draft,
+          version: (await getLatestDraft(room.roomId)) ? 2 : 1,
+        },
+      })
+    );
+
+    await addMessage(room.roomId, {
+      text: draft,
+      phase: 'ROUGH_DRAFT',
+      authorType: 'asema',
+      personaIndex: 0,
+    });
+
+    console.log(
+      `[rough] generated for ${room.roomId}, ~${draft.split(/\s+/).length} words`
+    );
+    return { roomId: room.roomId, createdAt, content: draft };
+  } catch (e) {
+    console.error('[rough] generation failed:', e?.message || e);
+    const fallback =
+      'Draft unavailable due to an AI error. Continue discussing your 250-word abstract together.';
+    const createdAt = Date.now();
+
+    await ddbDoc.send(
+      new PutCommand({
+        TableName: TABLES.drafts,
+        Item: {
+          roomId: room.roomId,
+          createdAt,
+          content: fallback,
+          version: (await getLatestDraft(room.roomId)) ? 2 : 1,
+        },
+      })
+    );
+    await addMessage(room.roomId, {
+      text: fallback,
+      phase: 'ROUGH_DRAFT',
+      authorType: 'asema',
+      personaIndex: 0,
+    });
+
+    return { roomId: room.roomId, createdAt, content: fallback };
+  }
+}
+
+// ---------- Stage Engine ----------
+const stageEngine = createStageEngine({
+  getRoom,
+  updateRoom,
+  advanceStageVal,
+  onStageAdvanced: async (room) => {
+    try {
+      // We no longer auto-generate the rough draft here.
+      // Just drop a nudge so they know stage changed.
+      await addMessage(room.roomId, {
+        text: `⏱️ Moving into ${room.stage}. Keep building together and call on me when you’re ready.`,
+        phase: room.stage,
+        authorType: 'asema',
+        personaIndex: 0,
+      });
+
+      const greeted = { ...(room.greetedForStage || {}) };
+      greeted[room.stage] = false;
+      await updateRoom(room.roomId, { greetedForStage: greeted });
+    } catch (e) {
+      console.error('[stageEngine onStageAdvanced] error', e);
+    }
+  },
+});
+stageEngine.start();
+
+// ---------- Health ----------
+app.get('/health', (_req, res) =>
+  res.json({ ok: true, region: AWS_REGION, time: new Date().toISOString() })
+);
+app.get('/api/health', (_req, res) =>
+  res.json({ ok: true, region: AWS_REGION, time: new Date().toISOString() })
+);
+app.get('/version', (_req, res) =>
+  res.json({
+    commit: process.env.GIT_COMMIT || null,
+    build: process.env.BUILD_ID || null,
+    time: new Date().toISOString(),
+  })
+);
+
+// ---------- Presenter: list rooms ----------
 app.get('/presenter/rooms', requireAuth, async (req, res) => {
   const siteId = String(req.query.siteId || '').trim().toUpperCase();
   if (!siteId) return res.json({ rooms: [] });
 
-  // Create/ensure 4 rooms per site by default (no GSI needed)
   const out = [];
   for (let i = 1; i <= 4; i++) {
     const id = `${siteId}-${i}`;
@@ -239,14 +395,16 @@ app.get('/presenter/rooms', requireAuth, async (req, res) => {
         tallies: r.voteTallies || {},
       },
     });
+    stageEngine.touch(id);
   }
   res.json({ rooms: out });
 });
 
-// ---------- Room state ----------
+// ---------- Room state & messages ----------
 app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const r = await ensureRoom(roomId);
+  stageEngine.touch(roomId);
   res.json({
     id: r.roomId,
     siteId: r.siteId,
@@ -262,38 +420,34 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
 app.post('/rooms/:roomId/messages', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const { text, phase, personaIndex = 0 } = req.body || {};
-  if (!text || typeof text !== 'string') return res.status(400).json({ error: 'text required' });
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({ error: 'text required' });
+  }
 
-  const createdAt = Date.now();
-  await ddbDoc.send(new PutCommand({
-    TableName: TABLES.messages || process.env.DDB_TABLE_MESSAGES || 'storibloom_messages',
-    Item: {
-      roomId,
-      createdAt,
-      uid: req.user.uid,
-      personaIndex,
-      authorType: 'user',
-      phase: phase || 'LOBBY',
-      text,
-    },
-  }));
-  res.json({ ok: true, createdAt });
+  const r = await ensureRoom(roomId);
+
+  // Do NOT lock input in ROUGH_DRAFT anymore; allow conversation.
+  if (r.inputLocked && (r.stage || 'LOBBY') !== 'FINAL' && r.stage !== 'ROUGH_DRAFT') {
+    return res.status(403).json({ error: 'input_locked' });
+  }
+
+  const saved = await addMessage(roomId, {
+    text,
+    phase: phase || r.stage || 'LOBBY',
+    authorType: 'user',
+    personaIndex,
+    uid: req.user.uid,
+  });
+
+  res.json({ ok: true, createdAt: saved.createdAt });
 });
 
-// ---------- Messages (read latest) ----------
 app.get('/rooms/:roomId/messages', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
-  // We assume PK: roomId, SK: createdAt (Number) in your storibloom_messages
-  // If you have a different key schema, adjust Query accordingly.
   const limit = Math.min(200, Number(req.query.limit || 100));
-  const { Items } = await ddbDoc.send(new QueryCommand({
-    TableName: TABLES.messages,
-    KeyConditionExpression: 'roomId = :r',
-    ExpressionAttributeValues: { ':r': roomId },
-    ScanIndexForward: true, // oldest first
-    Limit: limit,
-  }));
-  res.json({ messages: Items || [] });
+  const items = await getMessagesForRoom(roomId, limit);
+  stageEngine.touch(roomId);
+  res.json({ messages: items });
 });
 
 // ---------- Stage controls ----------
@@ -301,22 +455,39 @@ app.post('/rooms/:roomId/next', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const cur = await ensureRoom(roomId);
   const nextStage = advanceStageVal(cur.stage);
-  const updated = await updateRoom(roomId, { stage: nextStage, stageEndsAt: Date.now() + 10 * 60_000 });
-  res.json({ ok: true, stage: updated.stage, stageEndsAt: updated.stageEndsAt });
+  const updated = await updateRoom(roomId, {
+    stage: nextStage,
+    stageEndsAt: Date.now() + 10 * 60_000,
+  });
+  res.json({
+    ok: true,
+    stage: updated.stage,
+    stageEndsAt: updated.stageEndsAt,
+  });
 });
 
 app.post('/rooms/:roomId/extend', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const by = Math.max(1, Number((req.body && req.body.by) || 120));
   const cur = await ensureRoom(roomId);
-  const updated = await updateRoom(roomId, { stageEndsAt: (cur.stageEndsAt || Date.now()) + by * 1000 });
+  const updated = await updateRoom(roomId, {
+    stageEndsAt: (cur.stageEndsAt || Date.now()) + by * 1000,
+  });
   res.json({ ok: true, stageEndsAt: updated.stageEndsAt });
 });
 
 app.post('/rooms/:roomId/redo', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
-  const updated = await updateRoom(roomId, { stage: 'ROUGH_DRAFT', stageEndsAt: Date.now() + 10 * 60_000 });
-  res.json({ ok: true, stage: updated.stage, stageEndsAt: updated.stageEndsAt });
+  const updated = await updateRoom(roomId, {
+    stage: 'ROUGH_DRAFT',
+    stageEndsAt: Date.now() + 10 * 60_000,
+    inputLocked: false,
+  });
+  res.json({
+    ok: true,
+    stage: updated.stage,
+    stageEndsAt: updated.stageEndsAt,
+  });
 });
 
 app.post('/rooms/:roomId/lock', requireAuth, async (req, res) => {
@@ -329,9 +500,10 @@ app.post('/rooms/:roomId/lock', requireAuth, async (req, res) => {
 // ---------- Voting ----------
 app.get('/rooms/:roomId/vote', requireAuth, async (req, res) => {
   const r = await ensureRoom(req.params.roomId);
+  stageEngine.touch(r.roomId);
   res.json({
     votingOpen: !!r.voteOpen,
-    options: [], // client shows defaults if empty
+    options: [],
     votesReceived: Number(r.voteTotal || 0),
     counts: Object.values(r.voteTallies || {}),
     topic: r.topic || '',
@@ -347,13 +519,17 @@ app.post('/rooms/:roomId/vote/start', requireAuth, async (req, res) => {
 app.post('/rooms/:roomId/vote/submit', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const { choice } = req.body || {};
-  if (typeof choice !== 'number') return res.status(400).json({ error: 'choice must be a number' });
+  if (typeof choice !== 'number') {
+    return res.status(400).json({ error: 'choice must be a number' });
+  }
   const r = await ensureRoom(roomId);
   if (!r.voteOpen) return res.status(400).json({ error: 'voting_closed' });
-
   const tallies = { ...(r.voteTallies || {}) };
   tallies[choice] = (tallies[choice] || 0) + 1;
-  await updateRoom(roomId, { voteTallies: tallies, voteTotal: Number(r.voteTotal || 0) + 1 });
+  await updateRoom(roomId, {
+    voteTallies: tallies,
+    voteTotal: Number(r.voteTotal || 0) + 1,
+  });
   res.json({ ok: true });
 });
 
@@ -363,7 +539,6 @@ app.post('/rooms/:roomId/vote/close', requireAuth, async (req, res) => {
   const tallies = r.voteTallies || {};
   let topic = r.topic || '';
 
-  // Pick highest tally
   const entries = Object.entries(tallies);
   if (entries.length) {
     entries.sort((a, b) => (b[1] || 0) - (a[1] || 0));
@@ -382,41 +557,165 @@ app.post('/rooms/:roomId/vote/close', requireAuth, async (req, res) => {
   res.json({ ok: true, closed: true, topic });
 });
 
-// ---------- Ideas / Draft / Final / Ask stubs (write to Dynamo where useful) ----------
-app.post('/rooms/:roomId/welcome', requireAuth, async (_req, res) => res.json({ ok: true }));
-app.post('/rooms/:roomId/ask', requireAuth, async (_req, res) => res.json({ ok: true }));
-app.post('/rooms/:roomId/ideas/trigger', requireAuth, async (_req, res) => res.json({ ok: true }));
+// ---------- Idea summarization (Discovery + Idea Dump + Planning) ----------
+const IDEA_MIN_INTERVAL_MS = 8000;
+const ideaLastRun = new Map(); // roomId -> timestamp
 
-// Draft placeholder: write a minimal record to drafts table
-app.post('/rooms/:roomId/draft/generate', requireAuth, async (req, res) => {
-  const roomId = req.params.roomId;
-  const createdAt = Date.now();
-  await ddbDoc.send(new PutCommand({
-    TableName: TABLES.drafts,
-    Item: {
-      roomId,
-      createdAt,
-      content: 'Draft generated (placeholder)',
-      version: 1,
-    },
-  }));
-  // Also stash a small hint into room.ideaSummary for the sidebar
+function shouldRunIdeaSummary(roomId) {
+  const now = Date.now();
+  const last = ideaLastRun.get(roomId) || 0;
+  if (now - last < IDEA_MIN_INTERVAL_MS) return false;
+  ideaLastRun.set(roomId, now);
+  return true;
+}
+
+async function summarizeIdeas(roomId) {
   const r = await ensureRoom(roomId);
-  const merged = (r.ideaSummary ? `${r.ideaSummary}\n` : '') + '• Draft generated (placeholder)';
-  await updateRoom(roomId, { ideaSummary: merged });
-  res.json({ ok: true, createdAt });
+  const stage = r.stage || 'LOBBY';
+  if (!['DISCOVERY', 'IDEA_DUMP', 'PLANNING'].includes(stage)) return;
+
+  const all = await getMessagesForRoom(roomId, 800);
+  const phases = ['DISCOVERY', 'IDEA_DUMP', 'PLANNING'];
+  const humanLines = all
+    .filter(
+      (m) =>
+        phases.includes(m.phase || '') &&
+        (m.authorType || 'user') === 'user'
+    )
+    .map((m) => m.text);
+
+  if (humanLines.length === 0) {
+    await updateRoom(roomId, {
+      ideaSummary: '',
+      lastIdeaSummaryAt: Date.now(),
+    });
+    return;
+  }
+
+  try {
+    const summary = await Asema.summarizeIdeas(
+      stage,
+      r.topic || '',
+      humanLines
+    );
+    await updateRoom(roomId, {
+      ideaSummary: summary,
+      lastIdeaSummaryAt: Date.now(),
+    });
+  } catch (e) {
+    console.error('[ideas] summarize failed', e?.message || e);
+  }
+}
+
+app.post('/rooms/:roomId/ideas/trigger', requireAuth, async (req, res) => {
+  const roomId = req.params.roomId;
+  try {
+    if (shouldRunIdeaSummary(roomId)) {
+      await summarizeIdeas(roomId);
+      return res.json({ ok: true, ran: true });
+    }
+    return res.json({ ok: true, skipped: true });
+  } catch (e) {
+    console.error('[ideas/trigger] error', e);
+    return res.status(500).json({ error: 'summarize_failed' });
+  }
 });
 
-app.post('/rooms/:roomId/final/start', requireAuth, async (_req, res) => res.json({ ok: true }));
-app.post('/rooms/:roomId/final/complete', requireAuth, async (_req, res) => res.json({ ok: true }));
+// ---------- AI Greeting & Ask ----------
+app.post('/rooms/:roomId/welcome', requireAuth, async (req, res) => {
+  const roomId = req.params.roomId;
+  const r = await ensureRoom(roomId);
+  const stage = r.stage || 'LOBBY';
+  const greeted = r.greetedForStage || {};
+  if (greeted[stage]) return res.json({ ok: true, skipped: true });
 
-// ---------- Codes: consume (DynamoDB-backed) ----------
-/**
- * Body: { code: "P-1234" | "U-ABCD" }
- * Table: TABLES.codes (PK: code)
- * Returns: { siteId, role }
- * (Optional) marks consumed if attributes exist.
- */
+  try {
+    const text = await Asema.greet(stage, r.topic || '');
+    await addMessage(roomId, {
+      text,
+      phase: stage,
+      authorType: 'asema',
+    });
+    greeted[stage] = true;
+    await updateRoom(roomId, { greetedForStage: greeted });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[welcome] error', e);
+    res.json({ ok: true, fallback: true });
+  }
+});
+
+app.post('/rooms/:roomId/ask', requireAuth, async (req, res) => {
+  const roomId = req.params.roomId;
+  const { text } = req.body || {};
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({ error: 'text required' });
+  }
+
+  let r = await ensureRoom(roomId);
+  const stage = r.stage || 'LOBBY';
+
+  // Capture: "Asema AI this is our topic: X"
+  const extracted = Asema.extractTopicFromUtterance(text);
+  if (extracted) {
+    await updateRoom(roomId, { topic: extracted });
+    r = await ensureRoom(roomId);
+  }
+
+  try {
+    const reply = await Asema.replyToUser(stage, r.topic || '', text);
+    await addMessage(roomId, {
+      text: reply,
+      phase: stage,
+      authorType: 'asema',
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[ask] error', e);
+    const fallback =
+      'Nice direction — now anchor it with one clear character, place, and problem.';
+    await addMessage(roomId, {
+      text: fallback,
+      phase: stage,
+      authorType: 'asema',
+    });
+    res.json({ ok: true, fallback: true });
+  }
+});
+
+// ---------- Draft / Final ----------
+app.post('/rooms/:roomId/draft/generate', requireAuth, async (req, res) => {
+  const roomId = req.params.roomId;
+  const { mode } = req.body || {};
+  try {
+    const room = await ensureRoom(roomId);
+    if ((room.stage || 'LOBBY') !== 'ROUGH_DRAFT') {
+      return res
+        .status(400)
+        .json({ error: 'wrong_stage', stage: room.stage });
+    }
+
+    const force =
+      mode === 'regen' ||
+      mode === 'regenerate' ||
+      mode === 'ask';
+
+    const draft = await generateRoughDraftForRoom(room, { force });
+    res.json({ ok: true, ...draft });
+  } catch (e) {
+    console.error('[draft/generate] error', e);
+    res.status(500).json({ error: 'draft_failed' });
+  }
+});
+
+app.post('/rooms/:roomId/final/start', requireAuth, async (_req, res) =>
+  res.json({ ok: true })
+);
+app.post('/rooms/:roomId/final/complete', requireAuth, async (_req, res) =>
+  res.json({ ok: true })
+);
+
+// ---------- Codes: consume ----------
 app.post('/codes/consume', requireAuth, async (req, res) => {
   try {
     const { code } = req.body || {};
@@ -424,33 +723,40 @@ app.post('/codes/consume', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Missing code' });
     }
 
-    const getRes = await ddbDoc.send(new GetCommand({
-      TableName: TABLES.codes,
-      Key: { code: code.trim() },
-    }));
-
+    const getRes = await ddbDoc.send(
+      new GetCommand({
+        TableName: TABLES.codes,
+        Key: { code: code.trim() },
+      })
+    );
     const item = getRes.Item;
-    if (!item) return res.status(404).json({ error: 'Code not found or invalid' });
+    if (!item) {
+      return res.status(404).json({ error: 'Code not found or invalid' });
+    }
 
     try {
-      await ddbDoc.send(new UpdateCommand({
-        TableName: TABLES.codes,
-        Key: { code: item.code },
-        UpdateExpression: 'SET consumed = :c, usedBy = :u, consumedAt = :t',
-        ExpressionAttributeValues: {
-          ':c': true,
-          ':u': req.user.uid || '(unknown)',
-          ':t': Date.now(),
-        },
-      }));
+      await ddbDoc.send(
+        new UpdateCommand({
+          TableName: TABLES.codes,
+          Key: { code: item.code },
+          UpdateExpression:
+            'SET consumed = :c, usedBy = :u, consumedAt = :t',
+          ExpressionAttributeValues: {
+            ':c': true,
+            ':u': req.user.uid || '(unknown)',
+            ':t': Date.now(),
+          },
+        })
+      );
     } catch (e) {
       console.warn('[codes/consume] update skipped:', e?.message || e);
     }
 
-    // Ensure initial rooms for this site exist so presenter UI loads immediately
     const siteId = (item.siteId || 'E1').toUpperCase();
     for (let i = 1; i <= 4; i++) {
-      await ensureRoom(`${siteId}-${i}`);
+      const rid = `${siteId}-${i}`;
+      await ensureRoom(rid);
+      stageEngine.touch(rid);
     }
 
     return res.json({
@@ -463,29 +769,63 @@ app.post('/codes/consume', requireAuth, async (req, res) => {
   }
 });
 
-// ---------- Static Frontend (optional local serving) ----------
-function hasIndex(dir) { try { return fs.existsSync(path.join(dir, 'index.html')); } catch { return false; } }
+// ---------- Static (optional SPA) ----------
+function hasIndex(dir) {
+  try {
+    return fs.existsSync(path.join(dir, 'index.html'));
+  } catch {
+    return false;
+  }
+}
 const distDir = WEB_DIST_DIR;
 const distHasIndex = hasIndex(distDir);
 
 if (distHasIndex) {
-  app.use('/assets', express.static(path.join(distDir, 'assets'), { fallthrough: true, index: false, maxAge: '1h' }));
-  app.use('/app/assets', express.static(path.join(distDir, 'assets'), { fallthrough: true, index: false, maxAge: '1h' }));
+  app.use(
+    '/assets',
+    express.static(path.join(distDir, 'assets'), {
+      fallthrough: true,
+      index: false,
+      maxAge: '1h',
+    })
+  );
+  app.use(
+    '/app/assets',
+    express.static(path.join(distDir, 'assets'), {
+      fallthrough: true,
+      index: false,
+      maxAge: '1h',
+    })
+  );
 }
 
 app.get('/', (_req, res) => {
-  if (!ENABLE_SPA || !distHasIndex) return res.status(200).send('StoriBloom API (DynamoDB) ✅');
+  if (!ENABLE_SPA || !distHasIndex) {
+    return res.status(200).send('StoriBloom API (DynamoDB) ✅');
+  }
   const indexPath = path.join(distDir, 'index.html');
   res.sendFile(indexPath, (err) => {
-    if (err) { console.error('[static /] index error:', err?.message || err); res.status(404).send(`Error: index.html not found at '${indexPath}'`); }
+    if (err) {
+      console.error('[static /] index error', err);
+      res
+        .status(404)
+        .send(`Error: index.html not found at '${indexPath}'`);
+    }
   });
 });
 
 app.get('/app', (_req, res) => {
-  if (!ENABLE_SPA || !distHasIndex) return res.status(200).send('StoriBloom API (DynamoDB) ✅');
+  if (!ENABLE_SPA || !distHasIndex) {
+    return res.status(200).send('StoriBloom API (DynamoDB) ✅');
+  }
   const indexPath = path.join(distDir, 'index.html');
   res.sendFile(indexPath, (err) => {
-    if (err) { console.error('[static /app] index error:', err?.message || err); res.status(404).send(`Error: index.html not found at '${indexPath}'`); }
+    if (err) {
+      console.error('[static /app] index error', err);
+      res
+        .status(404)
+        .send(`Error: index.html not found at '${indexPath}'`);
+    }
   });
 });
 
@@ -493,26 +833,38 @@ if (ENABLE_SPA && distHasIndex) {
   app.get(/^\/app\/(.*)/, (_req, res) => {
     const indexPath = path.join(distDir, 'index.html');
     res.sendFile(indexPath, (err) => {
-      if (err) { console.error('[static fallback /app/*] error:', err?.message || err); res.status(404).send(`Error: index.html not found at '${indexPath}'`); }
+      if (err) {
+        console.error('[static fallback /app/*] error', err);
+        res
+          .status(404)
+          .send(`Error: index.html not found at '${indexPath}'`);
+      }
     });
   });
 
-  app.get(/^\/(?!api|health|version|rooms|codes|assets|presenter).*/, (_req, res, next) => {
-    const indexPath = path.join(distDir, 'index.html');
-    res.sendFile(indexPath, (err) => {
-      if (err) { console.error('[static fallback /*] error:', err?.message || err); next(); }
-    });
-  });
+  app.get(
+    /^\/(?!api|health|version|rooms|codes|assets|presenter).*/,
+    (_req, res, next) => {
+      const indexPath = path.join(distDir, 'index.html');
+      res.sendFile(indexPath, (err) => {
+        if (err) {
+          console.error('[static fallback /*] error', err);
+          next();
+        }
+      });
+    }
+  );
 }
 
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
-// ---------- 404 ----------
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found', path: req.path, method: req.method });
-});
+// ---------- 404 & Error handlers ----------
+app.use((req, res) =>
+  res
+    .status(404)
+    .json({ error: 'Not found', path: req.path, method: req.method })
+);
 
-// ---------- Error handler ----------
 app.use((err, _req, res, _next) => {
   console.error('[unhandled error]', err);
   res.status(500).json({ error: 'Internal Server Error' });
@@ -522,7 +874,15 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`API listening on 0.0.0.0:${PORT}`);
   console.log(`[env] region=${AWS_REGION}`);
-  console.log(`[env] endpoint=${AWS_DYNAMO_ENDPOINT || '(default)'}`);
-  console.log(`[env] CORS_ORIGINS=${CORS_ORIGINS.length ? CORS_ORIGINS.join(',') : '(all)'}`);
-  console.log(`[env] SPA=${ENABLE_SPA} dist=${distDir} present=${distHasIndex}`);
+  console.log(
+    `[env] endpoint=${AWS_DYNAMO_ENDPOINT || '(default)'}`
+  );
+  console.log(
+    `[env] CORS_ORIGINS=${
+      CORS_ORIGINS.length ? CORS_ORIGINS.join(',') : '(all)'
+    }`
+  );
+  console.log(
+    `[env] SPA=${ENABLE_SPA} dist=${WEB_DIST_DIR} present=${distHasIndex}`
+  );
 });

@@ -243,20 +243,43 @@ body {
 }
 
 /* Messages */
-.msg { display: flex; gap: 10px; align-items: flex-start; }
-.msg .bubble {
-  max-width: 70%;
-  padding: 10px 12px; border-radius: 14px; font-size: 14px; line-height: 1.35;
-  border: 1px solid rgba(255,255,255,.12);
-  background: rgba(255,255,255,.05);
+.msg {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
 }
-.msg.user .who { font-size: 18px; }
-.msg.user .bubble { background: rgba(255,255,255,.04); }
-.msg.asema .who { font-size: 18px; filter: drop-shadow(0 0 10px rgba(240,200,107,.6)); }
+
+.msg .avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  background: rgba(255,255,255,0.08);
+  flex-shrink: 0;
+}
+
+.msg .bubble {
+  max-width: 78%;
+  padding: 9px 11px;
+  border-radius: 16px;
+  font-size: 14px;
+  line-height: 1.4;
+  border: 1px solid rgba(255,255,255,.12);
+  background: rgba(13,13,15,.96);
+}
+
+/* Asema messages with subtle highlight */
 .msg.asema .bubble {
-  border-color: rgba(240,200,107,.48);
-  background: linear-gradient(180deg, rgba(240,200,107,.16), rgba(255,255,255,.03));
-  box-shadow: 0 8px 24px rgba(240,200,107,.12);
+  background: linear-gradient(
+    180deg,
+    rgba(240,200,107,0.16),
+    rgba(18,18,22,0.98)
+  );
+  border-color: rgba(240,200,107,0.5);
+  box-shadow: 0 4px 14px rgba(240,200,107,0.16);
 }
 
 /* Input dock */

@@ -1,66 +1,62 @@
 // api/stageEngine.js
-// Periodic stage advancement using storibloom_rooms only.
 
-import {
-  DynamoDBClient,
-} from '@aws-sdk/client-dynamodb';
-import {
-  DynamoDBDocumentClient,
-  GetCommand,
-  PutCommand,
-  ScanCommand,
-} from '@aws-sdk/lib-dynamodb';
+// Simple stage engine that:
+// - ticks once per second
+// - advances any "hot" room whose stageEndsAt has passed
+// - "hot" means it was touched recently (API traffic) or on codes/consume
+//
+// Usage:
+// const engine = createStageEngine({...}); engine.start(); engine.touch(roomId);
 
-const REGION = process.env.AWS_REGION || 'us-west-2';
-const TABLE_ROOMS = process.env.DDB_TABLE_ROOMS || 'storibloom_rooms';
+export function createStageEngine({ getRoom, updateRoom, advanceStageVal, onStageAdvanced }) {
+  const HOT_TTL_MS = 5 * 60_000; // keep rooms hot for 5 minutes after traffic
+  const MIN_STAGE_MS = 15_000;   // if a room has no stageEndsAt, give it at least 15s
+  const touched = new Map();     // roomId -> lastTouchedMs
+  let timer = null;
 
-const ddb = new DynamoDBClient({ region: REGION, ...(process.env.AWS_DYNAMO_ENDPOINT ? { endpoint: process.env.AWS_DYNAMO_ENDPOINT } : {}) });
-const ddbDoc = DynamoDBDocumentClient.from(ddb, { marshallOptions: { removeUndefinedValues: true } });
+  function touch(roomId) {
+    touched.set(roomId, Date.now());
+  }
 
-const ORDER = ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','ROUGH_DRAFT','EDITING','FINAL','CLOSED'];
-
-function nextStageVal(cur) {
-  const i = ORDER.indexOf(cur || 'LOBBY');
-  return i >= 0 && i < ORDER.length - 1 ? ORDER[i + 1] : (cur || 'LOBBY');
-}
-
-export async function setStage(roomId, action) {
-  const { Item: room } = await ddbDoc.send(new GetCommand({ TableName: TABLE_ROOMS, Key: { roomId } }));
-  if (!room) return;
-
-  let next = room.stage || 'LOBBY';
-  if (action === 'NEXT') next = nextStageVal(next);
-  if (action === 'REDO') next = 'ROUGH_DRAFT';
-
-  const endsAt = Date.now() + 10 * 60 * 1000;
-  const updated = { ...(room || {}), roomId, stage: next, stageEndsAt: endsAt, updatedAt: Date.now() };
-  await ddbDoc.send(new PutCommand({ TableName: TABLE_ROOMS, Item: updated }));
-  console.log(`[stageEngine] ${roomId} → ${next}`);
-}
-
-export async function extendStage(roomId, minutes) {
-  const { Item: room } = await ddbDoc.send(new GetCommand({ TableName: TABLE_ROOMS, Key: { roomId } }));
-  if (!room) return;
-  const cur = typeof room.stageEndsAt === 'number' ? room.stageEndsAt : Date.now();
-  const extended = cur + Math.max(1, minutes) * 60 * 1000;
-  const updated = { ...(room || {}), roomId, stageEndsAt: extended, updatedAt: Date.now() };
-  await ddbDoc.send(new PutCommand({ TableName: TABLE_ROOMS, Item: updated }));
-  console.log(`[stageEngine] extended ${roomId} by ${minutes}m`);
-}
-
-export function startStageLoop() {
-  // Every 10s, scan rooms and advance expired ones (cheap for small counts)
-  setInterval(async () => {
+  async function tick() {
     const now = Date.now();
-    try {
-      const scan = await ddbDoc.send(new ScanCommand({ TableName: TABLE_ROOMS, Limit: 200 }));
-      for (const r of scan.Items || []) {
-        if (r.stage && r.stage !== 'CLOSED' && typeof r.stageEndsAt === 'number' && r.stageEndsAt < now) {
-          await setStage(r.roomId, 'NEXT');
-        }
+    for (const [roomId, ts] of [...touched.entries()]) {
+      if (now - ts > HOT_TTL_MS) {
+        touched.delete(roomId);     // cool it down
+        continue;
       }
-    } catch (e) {
-      console.warn('[stageEngine] loop error', e?.message || e);
+      try {
+        const r = await getRoom(roomId);
+        if (!r) continue;
+        let endsAt = Number(r.stageEndsAt || 0);
+        if (!Number.isFinite(endsAt) || endsAt <= now) {
+          // Advance stage or ensure stageEndsAt is set
+          const nextStage = Number.isFinite(endsAt) && endsAt <= now
+            ? advanceStageVal(r.stage || 'LOBBY')
+            : (r.stage || 'LOBBY');
+          const dur = 2 * 60_000; // default 2 minutes each stage for demo
+          const updated = await updateRoom(roomId, {
+            stage: nextStage,
+            stageEndsAt: now + dur,
+          });
+          if (onStageAdvanced && updated.stage === nextStage) {
+            await onStageAdvanced(updated);
+          }
+        }
+      } catch (e) {
+        // keep ticking even if a room throws
+      }
     }
-  }, 10_000);
+  }
+
+  function start() {
+    if (timer) return;
+    timer = setInterval(tick, 1000);
+  }
+  function stop() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+
+  return { start, stop, touch };
 }
