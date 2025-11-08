@@ -1,62 +1,133 @@
 // api/stageEngine.js
 
-// Simple stage engine that:
-// - ticks once per second
-// - advances any "hot" room whose stageEndsAt has passed
-// - "hot" means it was touched recently (API traffic) or on codes/consume
-//
-// Usage:
-// const engine = createStageEngine({...}); engine.start(); engine.touch(roomId);
+/**
+ * Lightweight stage engine:
+ * - Tracks "hot" rooms (that have recent activity).
+ * - Every TICK_MS checks if stageEndsAt has passed.
+ * - If passed and stage !== 'CLOSED', advances to next stage.
+ *
+ * Durations:
+ * - LOBBY: 10 minutes
+ * - All other stages: 6 minutes
+ *
+ * server.js passes:
+ * - getRoom(roomId)
+ * - updateRoom(roomId, patch)
+ * - advanceStageVal(currentStage)
+ * - onStageAdvanced?(updatedRoom)
+ */
+
+const TICK_MS = 5_000;           // how often to check
+const TOUCH_TTL_MS = 30 * 60_000; // stop tracking room if idle 30m
+
+// Central place for durations (ms)
+const STAGE_DURATIONS = {
+  LOBBY: 10 * 60_000,
+  DISCOVERY: 6 * 60_000,
+  IDEA_DUMP: 6 * 60_000,
+  PLANNING: 6 * 60_000,
+  ROUGH_DRAFT: 6 * 60_000,
+  EDITING: 6 * 60_000,
+  FINAL: 6 * 60_000,
+};
+
+function getDurationForStage(stage) {
+  if (!stage) return 6 * 60_000;
+  return STAGE_DURATIONS[stage] || 6 * 60_000;
+}
 
 export function createStageEngine({ getRoom, updateRoom, advanceStageVal, onStageAdvanced }) {
-  const HOT_TTL_MS = 5 * 60_000; // keep rooms hot for 5 minutes after traffic
-  const MIN_STAGE_MS = 15_000;   // if a room has no stageEndsAt, give it at least 15s
-  const touched = new Map();     // roomId -> lastTouchedMs
-  let timer = null;
+  // roomId -> lastTouch
+  const hot = new Map();
 
   function touch(roomId) {
-    touched.set(roomId, Date.now());
+    if (!roomId) return;
+    hot.set(roomId, Date.now());
+  }
+
+  async function handleRoom(roomId, now) {
+    const lastTouch = hot.get(roomId);
+    if (!lastTouch || now - lastTouch > TOUCH_TTL_MS) {
+      hot.delete(roomId);
+      return;
+    }
+
+    const room = await getRoom(roomId);
+    if (!room) {
+      hot.delete(roomId);
+      return;
+    }
+
+    const stage = room.stage || 'LOBBY';
+    if (stage === 'CLOSED') return;
+
+    // Normalize stageEndsAt → timestamp
+    let endsAtMs = 0;
+    if (typeof room.stageEndsAt === 'number') {
+      endsAtMs = room.stageEndsAt;
+    } else if (room.stageEndsAt instanceof Date) {
+      endsAtMs = room.stageEndsAt.getTime();
+    } else if (room.stageEndsAt) {
+      const d = new Date(room.stageEndsAt);
+      if (!isNaN(d.getTime())) endsAtMs = d.getTime();
+    }
+
+    // If no stageEndsAt yet, set it based on current stage
+    if (!endsAtMs) {
+      const dur = getDurationForStage(stage);
+      const updated = await updateRoom(roomId, {
+        stage,
+        stageEndsAt: now + dur,
+      });
+      if (onStageAdvanced && updated) {
+        // Treat as "initialized" rather than advanced
+        await onStageAdvanced(updated);
+      }
+      return;
+    }
+
+    // If it's not time yet, do nothing
+    if (now < endsAtMs) return;
+
+    // Time's up → advance
+    const nextStage = advanceStageVal(stage);
+    if (!nextStage || nextStage === stage) return;
+
+    const nextDur = getDurationForStage(nextStage);
+    const updated = await updateRoom(roomId, {
+      stage: nextStage,
+      stageEndsAt: now + nextDur,
+    });
+
+    if (onStageAdvanced && updated) {
+      await onStageAdvanced(updated);
+    }
   }
 
   async function tick() {
     const now = Date.now();
-    for (const [roomId, ts] of [...touched.entries()]) {
-      if (now - ts > HOT_TTL_MS) {
-        touched.delete(roomId);     // cool it down
-        continue;
-      }
+    const ids = Array.from(hot.keys());
+    if (!ids.length) return;
+
+    for (const roomId of ids) {
       try {
-        const r = await getRoom(roomId);
-        if (!r) continue;
-        let endsAt = Number(r.stageEndsAt || 0);
-        if (!Number.isFinite(endsAt) || endsAt <= now) {
-          // Advance stage or ensure stageEndsAt is set
-          const nextStage = Number.isFinite(endsAt) && endsAt <= now
-            ? advanceStageVal(r.stage || 'LOBBY')
-            : (r.stage || 'LOBBY');
-          const dur = 2 * 60_000; // default 2 minutes each stage for demo
-          const updated = await updateRoom(roomId, {
-            stage: nextStage,
-            stageEndsAt: now + dur,
-          });
-          if (onStageAdvanced && updated.stage === nextStage) {
-            await onStageAdvanced(updated);
-          }
-        }
-      } catch (e) {
-        // keep ticking even if a room throws
+        // eslint-disable-next-line no-await-in-loop
+        await handleRoom(roomId, now);
+      } catch (err) {
+        console.error('[stageEngine] tick error for', roomId, err);
       }
     }
   }
 
   function start() {
-    if (timer) return;
-    timer = setInterval(tick, 1000);
-  }
-  function stop() {
-    if (timer) clearInterval(timer);
-    timer = null;
+    setInterval(() => {
+      tick().catch((err) => console.error('[stageEngine] unhandled tick error', err));
+    }, TICK_MS);
+    console.log('[stageEngine] started with durations:', STAGE_DURATIONS);
   }
 
-  return { start, stop, touch };
+  return { touch, start };
 }
+
+// Also export durations if you ever want to reuse in server.js
+export { STAGE_DURATIONS };

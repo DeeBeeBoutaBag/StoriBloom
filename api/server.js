@@ -155,6 +155,20 @@ const ROOM_ORDER = [
   'CLOSED',
 ];
 
+const STAGE_DURATIONS = {
+  LOBBY: 10 * 60_000,
+  DISCOVERY: 6 * 60_000,
+  IDEA_DUMP: 6 * 60_000,
+  PLANNING: 6 * 60_000,
+  ROUGH_DRAFT: 6 * 60_000,
+  EDITING: 6 * 60_000,
+  FINAL: 6 * 60_000,
+};
+function getStageDuration(stage) {
+  return STAGE_DURATIONS[stage] || 6 * 60_000;
+}
+
+
 function parseRoomId(roomId) {
   const [siteId, idxStr] = String(roomId).split('-');
   return { siteId: (siteId || 'E1').toUpperCase(), index: Number(idxStr || 1) };
@@ -184,7 +198,7 @@ async function ensureRoom(roomId) {
     siteId,
     index,
     stage: DEFAULT_STAGE,
-    stageEndsAt: Date.now() + 60_000,
+    stageEndsAt: Date.now() + getStageDuration('LOBBY'),
     inputLocked: false,
     topic: '',
     ideaSummary: '',
@@ -455,15 +469,12 @@ app.post('/rooms/:roomId/next', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const cur = await ensureRoom(roomId);
   const nextStage = advanceStageVal(cur.stage);
+  const dur = getStageDuration(nextStage);
   const updated = await updateRoom(roomId, {
     stage: nextStage,
-    stageEndsAt: Date.now() + 10 * 60_000,
+    stageEndsAt: Date.now() + dur,
   });
-  res.json({
-    ok: true,
-    stage: updated.stage,
-    stageEndsAt: updated.stageEndsAt,
-  });
+  res.json({ ok: true, stage: updated.stage, stageEndsAt: updated.stageEndsAt });
 });
 
 app.post('/rooms/:roomId/extend', requireAuth, async (req, res) => {
