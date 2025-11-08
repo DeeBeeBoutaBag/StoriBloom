@@ -431,9 +431,9 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
   let stage = r.stage || 'LOBBY';
   let endsAtMs = toMs(r.stageEndsAt);
 
-  // 👇 Fix: if we're in LOBBY and timer is missing/expired, give a fresh 10 minutes
-  if (stage === 'LOBBY' && (!endsAtMs || endsAtMs < now)) {
-    endsAtMs = now + getStageDuration('LOBBY');
+  // ✅ Only fix missing timers in LOBBY (do NOT restart if already expired)
+  if (stage === 'LOBBY' && !endsAtMs) {
+    endsAtMs = now + getStageDuration('LOBBY'); // 10 min
     r = await updateRoom(roomId, {
       stage: 'LOBBY',
       stageEndsAt: endsAtMs,
@@ -441,6 +441,7 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
     stage = r.stage || 'LOBBY';
   }
 
+  // Touch for stage engine (keeps it in the active set)
   stageEngine.touch(roomId);
 
   res.json({
