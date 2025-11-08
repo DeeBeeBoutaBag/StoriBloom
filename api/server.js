@@ -230,28 +230,32 @@ async function updateRoom(roomId, patch) {
   return next;
 }
 
-async function addMessage(
-  roomId,
-  { text, phase, authorType = 'user', personaIndex = 0, uid = null }
-) {
+async function addMessage(roomId, {
+  text,
+  phase,
+  authorType = 'user',
+  personaIndex = 0,
+  uid = null,
+  emoji = null,
+}) {
   const createdAt = Date.now();
-  await ddbDoc.send(
-    new PutCommand({
-      TableName: TABLES.messages,
-      Item: {
-        roomId,
-        createdAt,
-        uid: uid || '(system)',
-        personaIndex,
-        authorType,
-        phase: phase || 'LOBBY',
-        text,
-      },
-    })
-  );
+  await ddbDoc.send(new PutCommand({
+    TableName: TABLES.messages,
+    Item: {
+      roomId,
+      createdAt,
+      uid: uid || '(system)',
+      personaIndex,
+      emoji: emoji || null,
+      authorType,
+      phase: phase || 'LOBBY',
+      text,
+    },
+  }));
   stageEngine.touch(roomId);
   return { createdAt };
 }
+
 
 async function getMessagesForRoom(roomId, limit = 200) {
   const { Items } = await ddbDoc.send(
@@ -458,7 +462,7 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
 
 app.post('/rooms/:roomId/messages', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
-  const { text, phase, personaIndex = 0 } = req.body || {};
+  const { text, phase, personaIndex = 0, emoji } = req.body || {};
   if (!text || typeof text !== 'string') {
     return res.status(400).json({ error: 'text required' });
   }
@@ -471,12 +475,13 @@ app.post('/rooms/:roomId/messages', requireAuth, async (req, res) => {
   }
 
   const saved = await addMessage(roomId, {
-    text,
-    phase: phase || r.stage || 'LOBBY',
-    authorType: 'user',
-    personaIndex,
-    uid: req.user.uid,
-  });
+  text,
+  phase: phase || r.stage || 'LOBBY',
+  authorType: 'user',
+  personaIndex,
+  uid: req.user.uid,
+  emoji: emoji || null,
+});
 
   res.json({ ok: true, createdAt: saved.createdAt });
 });

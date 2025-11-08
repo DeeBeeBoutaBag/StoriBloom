@@ -244,8 +244,10 @@ export default function Room() {
     const t = text.trim();
     if (!t) return;
 
-    // Respect input lock except FINAL (and ROUGH_DRAFT stays open per backend rules)
+    // Respect input lock except FINAL and ROUGH_DRAFT (kept open for collab)
     if (roomMeta.inputLocked && stage !== 'FINAL' && stage !== 'ROUGH_DRAFT') return;
+
+    const emoji = personas[activePersona] || personas[0];
 
     try {
       await fetch(`${API_BASE}/rooms/${roomId}/messages`, {
@@ -255,6 +257,7 @@ export default function Room() {
           text: t,
           phase: stage,
           personaIndex: activePersona,
+          emoji, // include chosen emoji so others see correct identity
         }),
       });
     } catch (e) {
@@ -262,7 +265,7 @@ export default function Room() {
     }
     setText('');
 
-    // If user calls Asema by name → backend /ask (dynamic, includes topic capture)
+    // If user calls Asema by name → backend /ask
     if (/(^|\s)asema[\s,!?]/i.test(t) || /^asema\b/i.test(t)) {
       try {
         await fetch(`${API_BASE}/rooms/${roomId}/ask`, {
@@ -275,7 +278,7 @@ export default function Room() {
       }
     }
 
-    // Idea summary trigger (server throttles so we can fire freely)
+    // Idea summary trigger (server throttles)
     if (stage === 'DISCOVERY' || stage === 'IDEA_DUMP' || stage === 'PLANNING') {
       try {
         await fetch(`${API_BASE}/rooms/${roomId}/ideas/trigger`, {
@@ -345,7 +348,7 @@ export default function Room() {
   const canType =
     !roomMeta.inputLocked ||
     stage === 'FINAL' ||
-    stage === 'ROUGH_DRAFT'; // keep ROUGH_DRAFT open for collaboration
+    stage === 'ROUGH_DRAFT';
 
   return (
     <>
@@ -434,8 +437,10 @@ export default function Room() {
                     who={
                       m.authorType === 'asema'
                         ? '🤖'
-                        : personas[m.personaIndex] ||
-                          personas[0]
+                        : (m.emoji ||
+                           personas[m.personaIndex] ||
+                           personas[0] ||
+                           '🙂')
                     }
                     text={m.text}
                   />
