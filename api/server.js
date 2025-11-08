@@ -417,14 +417,38 @@ app.get('/presenter/rooms', requireAuth, async (req, res) => {
 // ---------- Room state & messages ----------
 app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
-  const r = await ensureRoom(roomId);
+  let r = await ensureRoom(roomId);
+  const now = Date.now();
+
+  // Normalize stageEndsAt -> ms
+  const toMs = (val) => {
+    if (!val) return 0;
+    if (typeof val === 'number') return val;
+    const d = new Date(val);
+    return Number.isNaN(d.getTime()) ? 0 : d.getTime();
+  };
+
+  let stage = r.stage || 'LOBBY';
+  let endsAtMs = toMs(r.stageEndsAt);
+
+  // 👇 Fix: if we're in LOBBY and timer is missing/expired, give a fresh 10 minutes
+  if (stage === 'LOBBY' && (!endsAtMs || endsAtMs < now)) {
+    endsAtMs = now + getStageDuration('LOBBY');
+    r = await updateRoom(roomId, {
+      stage: 'LOBBY',
+      stageEndsAt: endsAtMs,
+    });
+    stage = r.stage || 'LOBBY';
+  }
+
   stageEngine.touch(roomId);
+
   res.json({
     id: r.roomId,
     siteId: r.siteId,
     index: r.index,
-    stage: r.stage,
-    stageEndsAt: r.stageEndsAt,
+    stage,
+    stageEndsAt: endsAtMs,
     inputLocked: !!r.inputLocked,
     topic: r.topic || '',
     ideaSummary: r.ideaSummary || '',
