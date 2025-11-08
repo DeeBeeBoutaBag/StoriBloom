@@ -42,8 +42,10 @@ export default function Login() {
     try {
       setBusy(true);
 
+      // Ensure guest token
       await ensureGuest();
 
+      // Consume code -> get site + role
       const res = await fetch(`${API_BASE}/codes/consume`, {
         method: 'POST',
         ...(await authHeaders()),
@@ -58,6 +60,7 @@ export default function Login() {
       }
 
       const role = json.role || 'PARTICIPANT';
+      const siteId = json.siteId || 'E1';
       sessionStorage.setItem('role', role);
 
       if (role === 'PRESENTER') {
@@ -66,16 +69,27 @@ export default function Login() {
         return;
       }
 
-      const personas =
-        mode === 'pair' ? [emoji1, emoji2] : [emoji1];
-      sessionStorage.setItem(
-        'personas',
-        JSON.stringify(personas)
-      );
+      // Participant: store personas + mode
+      const personas = mode === 'pair' ? [emoji1, emoji2] : [emoji1];
+      sessionStorage.setItem('personas', JSON.stringify(personas));
       sessionStorage.setItem('mode', mode);
 
-      const roomId =
-        json.roomId || `${json.siteId || 'E1'}-1`;
+      // Ask API to assign a room (max 6 per room, rolls across rooms)
+      let roomId = `${siteId}-1`;
+      try {
+        const assignRes = await fetch(`${API_BASE}/rooms/assign`, {
+          method: 'POST',
+          ...(await authHeaders()),
+          body: JSON.stringify({ siteId }),
+        });
+        const assignJson = await assignRes.json().catch(() => ({}));
+        if (assignRes.ok && assignJson.roomId) {
+          roomId = assignJson.roomId;
+        }
+      } catch (e) {
+        console.warn('[login] /rooms/assign failed, falling back to first room', e);
+      }
+
       window.location.href = `/room/${roomId}`;
     } catch (e) {
       console.error(e);
@@ -130,32 +144,22 @@ export default function Login() {
               className="input mt6"
               placeholder="U-TEST1 or P-1234"
               value={code}
-              onChange={(e) =>
-                setCode(e.target.value)
-              }
-              onKeyDown={(e) =>
-                e.key === 'Enter' && submit()
-              }
+              onChange={(e) => setCode(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && submit()}
               disabled={busy}
             />
           </div>
 
           <div className="row mt16">
             <button
-              className={`btn ${
-                mode === 'individual' ? '' : 'ghost'
-              }`}
-              onClick={() =>
-                setMode('individual')
-              }
+              className={`btn ${mode === 'individual' ? '' : 'ghost'}`}
+              onClick={() => setMode('individual')}
               disabled={busy}
             >
               Individual
             </button>
             <button
-              className={`btn ${
-                mode === 'pair' ? '' : 'ghost'
-              }`}
+              className={`btn ${mode === 'pair' ? '' : 'ghost'}`}
               onClick={() => setMode('pair')}
               disabled={busy}
             >
@@ -227,9 +231,7 @@ export default function Login() {
               onClick={submit}
               disabled={busy}
             >
-              {busy
-                ? 'Entering…'
-                : 'Enter StoriBloom'}
+              {busy ? 'Entering…' : 'Enter StoriBloom'}
             </button>
             <div
               style={{
@@ -239,9 +241,7 @@ export default function Login() {
               }}
             >
               Tip: press{' '}
-              <span
-                style={{ color: 'var(--gold)' }}
-              >
+              <span style={{ color: 'var(--gold)' }}>
                 Enter
               </span>{' '}
               to submit.
@@ -266,9 +266,7 @@ export default function Login() {
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         onPick={(e) =>
-          activePicker === 1
-            ? setEmoji1(e)
-            : setEmoji2(e)
+          activePicker === 1 ? setEmoji1(e) : setEmoji2(e)
         }
       />
     </>

@@ -168,7 +168,6 @@ function getStageDuration(stage) {
   return STAGE_DURATIONS[stage] || 6 * 60_000;
 }
 
-
 function parseRoomId(roomId) {
   const [siteId, idxStr] = String(roomId).split('-');
   return { siteId: (siteId || 'E1').toUpperCase(), index: Number(idxStr || 1) };
@@ -190,7 +189,10 @@ async function getRoom(roomId) {
 
 async function ensureRoom(roomId) {
   let r = await getRoom(roomId);
-  if (r) return r;
+  if (r) {
+    if (!Array.isArray(r.seats)) r.seats = []; // ensure seats exists
+    return r;
+  }
 
   const { siteId, index } = parseRoomId(roomId);
   r = {
@@ -206,6 +208,7 @@ async function ensureRoom(roomId) {
     voteTotal: 0,
     voteTallies: {},
     greetedForStage: {},
+    seats: [], // new: track occupancy
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
@@ -223,6 +226,7 @@ async function updateRoom(roomId, patch) {
     ...patch,
     updatedAt: Date.now(),
   };
+  if (!Array.isArray(next.seats)) next.seats = [];
   await ddbDoc.send(
     new PutCommand({ TableName: TABLES.rooms, Item: next })
   );
@@ -230,32 +234,36 @@ async function updateRoom(roomId, patch) {
   return next;
 }
 
-async function addMessage(roomId, {
-  text,
-  phase,
-  authorType = 'user',
-  personaIndex = 0,
-  uid = null,
-  emoji = null,
-}) {
+async function addMessage(
+  roomId,
+  {
+    text,
+    phase,
+    authorType = 'user',
+    personaIndex = 0,
+    uid = null,
+    emoji = null,
+  }
+) {
   const createdAt = Date.now();
-  await ddbDoc.send(new PutCommand({
-    TableName: TABLES.messages,
-    Item: {
-      roomId,
-      createdAt,
-      uid: uid || '(system)',
-      personaIndex,
-      emoji: emoji || null,
-      authorType,
-      phase: phase || 'LOBBY',
-      text,
-    },
-  }));
+  await ddbDoc.send(
+    new PutCommand({
+      TableName: TABLES.messages,
+      Item: {
+        roomId,
+        createdAt,
+        uid: uid || '(system)',
+        personaIndex,
+        emoji: emoji || null,
+        authorType,
+        phase: phase || 'LOBBY',
+        text,
+      },
+    })
+  );
   stageEngine.touch(roomId);
   return { createdAt };
 }
-
 
 async function getMessagesForRoom(roomId, limit = 200) {
   const { Items } = await ddbDoc.send(
@@ -350,6 +358,81 @@ async function generateRoughDraftForRoom(room, { force = false } = {}) {
   }
 }
 
+// ---------- Room Assignment (6 per room, up to 5 rooms) ----------
+async function assignRoomForUser(siteIdRaw, uid) {
+  const siteId = String(siteIdRaw || '').trim().toUpperCase();
+  if (!siteId) throw new Error('siteId required');
+
+  const MAX_ROOMS = 5;
+  const MAX_SEATS = 6;
+
+  const rooms = [];
+
+  // Ensure rooms, normalize seats, and check if already assigned
+  for (let i = 1; i <= MAX_ROOMS; i++) {
+    const roomId = `${siteId}-${i}`;
+    let r = await ensureRoom(roomId);
+
+    let seats = Array.isArray(r.seats) ? r.seats.filter((s) => s && s.uid) : [];
+    const seen = new Set();
+    seats = seats.filter((s) => {
+      if (!s.uid || seen.has(s.uid)) return false;
+      seen.add(s.uid);
+      return true;
+    });
+
+    // Already seated in this room
+    if (seats.some((s) => s.uid === uid)) {
+      if (seats.length !== (r.seats || []).length) {
+        r = await updateRoom(roomId, { seats });
+      }
+      return {
+        roomId,
+        index: r.index,
+        siteId,
+        seats: seats.length,
+      };
+    }
+
+    // Persist cleaned seats if changed
+    if (seats.length !== (r.seats || []).length) {
+      r = await updateRoom(roomId, { seats });
+    }
+
+    rooms.push({ roomId, index: r.index, seats });
+  }
+
+  // Pick first room with < 6 seats, else last room as overflow
+  let target = rooms.find((r) => r.seats.length < MAX_SEATS);
+  if (!target) {
+    target = rooms[rooms.length - 1];
+  }
+
+  const newSeats = [...target.seats, { uid }];
+  await updateRoom(target.roomId, { seats: newSeats });
+
+  return {
+    roomId: target.roomId,
+    index: target.index,
+    siteId,
+    seats: newSeats.length,
+  };
+}
+
+app.post('/rooms/assign', requireAuth, async (req, res) => {
+  try {
+    const { siteId } = req.body || {};
+    if (!siteId) {
+      return res.status(400).json({ error: 'siteId required' });
+    }
+    const assigned = await assignRoomForUser(siteId, req.user.uid);
+    return res.json(assigned);
+  } catch (e) {
+    console.error('[/rooms/assign] error', e);
+    return res.status(500).json({ error: 'assign_failed' });
+  }
+});
+
 // ---------- Stage Engine ----------
 const stageEngine = createStageEngine({
   getRoom,
@@ -357,8 +440,7 @@ const stageEngine = createStageEngine({
   advanceStageVal,
   onStageAdvanced: async (room) => {
     try {
-      // We no longer auto-generate the rough draft here.
-      // Just drop a nudge so they know stage changed.
+      // Nudge only; rough draft is user-triggered
       await addMessage(room.roomId, {
         text: `⏱️ Moving into ${room.stage}. Keep building together and call on me when you’re ready.`,
         phase: room.stage,
@@ -397,7 +479,8 @@ app.get('/presenter/rooms', requireAuth, async (req, res) => {
   if (!siteId) return res.json({ rooms: [] });
 
   const out = [];
-  for (let i = 1; i <= 4; i++) {
+  const MAX_ROOMS = 5;
+  for (let i = 1; i <= MAX_ROOMS; i++) {
     const id = `${siteId}-${i}`;
     const r = await ensureRoom(id);
     out.push({
@@ -406,7 +489,7 @@ app.get('/presenter/rooms', requireAuth, async (req, res) => {
       stage: r.stage,
       inputLocked: !!r.inputLocked,
       topic: r.topic || '',
-      seats: r.seats || null,
+      seats: Array.isArray(r.seats) ? r.seats.length : 0,
       vote: {
         open: !!r.voteOpen,
         total: Number(r.voteTotal || 0),
@@ -435,9 +518,9 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
   let stage = r.stage || 'LOBBY';
   let endsAtMs = toMs(r.stageEndsAt);
 
-  // ✅ Only fix missing timers in LOBBY (do NOT restart if already expired)
+  // Only set missing LOBBY timer once (do not loop-reset)
   if (stage === 'LOBBY' && !endsAtMs) {
-    endsAtMs = now + getStageDuration('LOBBY'); // 10 min
+    endsAtMs = now + getStageDuration('LOBBY');
     r = await updateRoom(roomId, {
       stage: 'LOBBY',
       stageEndsAt: endsAtMs,
@@ -445,7 +528,6 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
     stage = r.stage || 'LOBBY';
   }
 
-  // Touch for stage engine (keeps it in the active set)
   stageEngine.touch(roomId);
 
   res.json({
@@ -469,19 +551,23 @@ app.post('/rooms/:roomId/messages', requireAuth, async (req, res) => {
 
   const r = await ensureRoom(roomId);
 
-  // Do NOT lock input in ROUGH_DRAFT anymore; allow conversation.
-  if (r.inputLocked && (r.stage || 'LOBBY') !== 'FINAL' && r.stage !== 'ROUGH_DRAFT') {
+  // Keep ROUGH_DRAFT open; respect lock elsewhere except FINAL
+  if (
+    r.inputLocked &&
+    (r.stage || 'LOBBY') !== 'FINAL' &&
+    r.stage !== 'ROUGH_DRAFT'
+  ) {
     return res.status(403).json({ error: 'input_locked' });
   }
 
   const saved = await addMessage(roomId, {
-  text,
-  phase: phase || r.stage || 'LOBBY',
-  authorType: 'user',
-  personaIndex,
-  uid: req.user.uid,
-  emoji: emoji || null,
-});
+    text,
+    phase: phase || r.stage || 'LOBBY',
+    authorType: 'user',
+    personaIndex,
+    uid: req.user.uid,
+    emoji: emoji || null,
+  });
 
   res.json({ ok: true, createdAt: saved.createdAt });
 });
@@ -696,7 +782,7 @@ app.post('/rooms/:roomId/ask', requireAuth, async (req, res) => {
   let r = await ensureRoom(roomId);
   const stage = r.stage || 'LOBBY';
 
-  // Capture: "Asema AI this is our topic: X"
+  // Capture topic utterances
   const extracted = Asema.extractTopicFromUtterance(text);
   if (extracted) {
     await updateRoom(roomId, { topic: extracted });
@@ -794,7 +880,8 @@ app.post('/codes/consume', requireAuth, async (req, res) => {
     }
 
     const siteId = (item.siteId || 'E1').toUpperCase();
-    for (let i = 1; i <= 4; i++) {
+    const MAX_ROOMS = 5;
+    for (let i = 1; i <= MAX_ROOMS; i++) {
       const rid = `${siteId}-${i}`;
       await ensureRoom(rid);
       stageEngine.touch(rid);
