@@ -8,4 +8,5 @@ api/.env
 web/.env
 node_modules/
 **/node_modules/
-web/.env.production
+web/.env.productionapi/.env
+.env
