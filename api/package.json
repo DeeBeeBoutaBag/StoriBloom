@@ -7,8 +7,8 @@
     "node": ">=20 <21"
   },
   "scripts": {
-    "start": "node server.js",
-    "dev": "NODE_ENV=development node server.js"
+    "dev": "NODE_ENV=development node server.js",
+    "start": "NODE_ENV=production node server.js"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.922.0",
