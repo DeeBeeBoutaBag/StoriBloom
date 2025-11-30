@@ -1073,3 +1073,16 @@ body {
     text-align: left;
   }
 }
+/* Override glass width inside presenter view so cards don't overlap */
+.presenter-wrap .glass {
+  width: 100%;
+  max-width: none;
+  box-sizing: border-box;
+}
+.presenter-head.glass,
+.presenter-stage-strip.glass,
+.presenter-empty.glass,
+.room-card.glass {
+  width: 100%;
+  max-width: none;
+}
