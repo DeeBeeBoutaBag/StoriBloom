@@ -78,30 +78,31 @@ export default function Presenter() {
     let mounted = true;
 
     async function load() {
-      setLoading(true);
-      try {
-        const url = new URL(
-          `${API_BASE}/presenter/rooms`,
-          window.location.origin
-        );
-        url.searchParams.set('siteId', siteId.toUpperCase());
+  setLoading(true);
+  try {
+    // Use API_BASE directly; new URL is fine but not required
+    const url = `${API_BASE}/presenter/rooms?siteId=${encodeURIComponent(
+      siteId.toUpperCase()
+    )}`;
 
-        const res = await fetch(url.toString(), {
-          headers: await authHeaders(),
-        });
-        if (!res.ok) throw new Error('rooms fetch failed');
+    // IMPORTANT: pass authHeaders() as the full init object,
+    // just like in Room.jsx, not as "headers: ..."
+    const res = await fetch(url, await authHeaders());
+    if (!res.ok) throw new Error('rooms fetch failed');
 
-        const j = await res.json();
-        if (!mounted) return;
-        setRooms(Array.isArray(j.rooms) ? j.rooms : []);
-        setLastRefreshed(new Date());
-      } catch (err) {
-        console.error('[Presenter] rooms load error:', err);
-        if (mounted) setRooms([]);
-      } finally {
-        if (mounted) setLoading(false);
-      }
-    }
+    const j = await res.json();
+    if (!mounted) return;
+
+    const next = Array.isArray(j.rooms) ? j.rooms : [];
+    setRooms(next);
+  } catch (err) {
+    console.error('[Presenter] rooms load error:', err);
+    if (mounted) setRooms([]);
+  } finally {
+    if (mounted) setLoading(false);
+  }
+}
+
 
     load();
     const id = setInterval(load, 2500);
