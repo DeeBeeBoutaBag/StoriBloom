@@ -17,12 +17,17 @@ if (!rootEl) {
 
 createRoot(rootEl).render(
   <React.StrictMode>
-    {/* basename ensures router works under Render Static with <base href="/"> */}
     <BrowserRouter basename="/">
       <Routes>
         <Route path="/" element={<App />}>
+          {/* landing / login */}
           <Route index element={<Login />} />
+
+          {/* participant rooms */}
           <Route path="room/:roomId" element={<Room />} />
+
+          {/* presenter HUD – supports /presenter and /presenter/E1 */}
+          <Route path="presenter" element={<Presenter />} />
           <Route path="presenter/:siteId" element={<Presenter />} />
         </Route>
       </Routes>
