@@ -20,6 +20,45 @@ const TOTAL_BY_STAGE = {
   FINAL: 360,
 };
 
+// Friendly labels + guidance per stage
+const STAGE_META = {
+  LOBBY: {
+    label: 'Lobby',
+    tagline: 'Welcome in. Say hello and get comfortable with your group.',
+    hint: 'Share names (if you want), pronouns, or vibes. Get used to typing before things get busy.',
+  },
+  DISCOVERY: {
+    label: 'Discovery',
+    tagline: 'Name the issue before you fix it.',
+    hint: 'Drop real-world stories, observations, and questions about the issue. No need to be perfect.',
+  },
+  IDEA_DUMP: {
+    label: 'Idea Dump',
+    tagline: 'Flood the room with raw ideas.',
+    hint: 'Short, messy ideas are perfect here. Type fast; let Asema help sort it later.',
+  },
+  PLANNING: {
+    label: 'Planning',
+    tagline: 'Turn the mess into a plan.',
+    hint: 'Group similar ideas, pick a central angle, and decide what belongs in your final abstract.',
+  },
+  ROUGH_DRAFT: {
+    label: 'Rough Draft',
+    tagline: 'Shape your first draft with Asema.',
+    hint: 'Ask Asema to revise, cut, or expand. You can still chat and suggest edits together.',
+  },
+  EDITING: {
+    label: 'Editing',
+    tagline: 'Tighten the language and sharpen the story.',
+    hint: 'Fix confusing parts, clarify the main point, and make sure the abstract sounds like your group.',
+  },
+  FINAL: {
+    label: 'Final',
+    tagline: 'Lock in the version you want to share.',
+    hint: 'Do last tweaks. When ready, type “done” or “submit” in the chat and tell your facilitator.',
+  },
+};
+
 export default function Room() {
   const { roomId } = useParams();
 
@@ -350,6 +389,12 @@ export default function Room() {
     stage === 'FINAL' ||
     stage === 'ROUGH_DRAFT';
 
+  const meta = STAGE_META[stage] || {
+    label: stage,
+    tagline: '',
+    hint: '',
+  };
+
   return (
     <>
       <div className="heatmap-bg" />
@@ -362,6 +407,47 @@ export default function Room() {
           roomIndex={roomMeta.index}
           stage={stage}
         />
+
+        {/* Room identity strip */}
+        <div
+          className="room-identity"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            marginBottom: 8,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 12,
+              textTransform: 'uppercase',
+              letterSpacing: '0.08em',
+              color: '#9ca3af',
+            }}
+          >
+            Site {roomMeta.siteId || '?'} · Room {roomMeta.index || 1}
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              gap: 4,
+              fontSize: 16,
+            }}
+          >
+            {personas.map((p, i) => (
+              <span key={i}>{p}</span>
+            ))}
+          </div>
+          {roomMeta.topic && (
+            <div
+              className="hud-pill"
+              style={{ marginLeft: 'auto', maxWidth: '50%' }}
+            >
+              Topic: <b>{roomMeta.topic}</b>
+            </div>
+          )}
+        </div>
 
         <div
           style={{
@@ -378,46 +464,69 @@ export default function Room() {
           {/* Chat card */}
           <div className="chat">
             {/* Header */}
-            <div className="chat-head">
-              <span className="stage-badge">{stage}</span>
-              <div className="ribbon" style={{ marginLeft: 10 }}>
-                {ORDER.map((s) => (
-                  <span
-                    key={s}
-                    className={s === stage ? 'on' : ''}
-                  >
-                    {s}
-                  </span>
-                ))}
-              </div>
-
+            <div className="chat-head" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
               <div
                 style={{
-                  marginLeft: 'auto',
                   display: 'flex',
                   alignItems: 'center',
                   gap: 10,
                 }}
               >
-                <CountdownRing
-                  secondsLeft={secsLeft}
-                  secondsTotal={total}
-                />
-                <div
-                  className="persona-choices"
-                  title="Choose persona"
-                >
-                  {personas.map((p, i) => (
-                    <button
-                      key={i}
-                      className={i === activePersona ? 'active' : ''}
-                      onClick={() => setActivePersona(i)}
+                <span className="stage-badge">
+                  {meta.label.toUpperCase()}
+                </span>
+                <div className="ribbon" style={{ marginLeft: 4 }}>
+                  {ORDER.map((s) => (
+                    <span
+                      key={s}
+                      className={s === stage ? 'on' : ''}
                     >
-                      {p}
-                    </button>
+                      {s}
+                    </span>
                   ))}
                 </div>
+
+                <div
+                  style={{
+                    marginLeft: 'auto',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 10,
+                  }}
+                >
+                  <CountdownRing
+                    secondsLeft={secsLeft}
+                    secondsTotal={total}
+                  />
+                  <div
+                    className="persona-choices"
+                    title="Choose persona"
+                  >
+                    {personas.map((p, i) => (
+                      <button
+                        key={i}
+                        className={i === activePersona ? 'active' : ''}
+                        onClick={() => setActivePersona(i)}
+                      >
+                        {p}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
+
+              {/* Stage tagline */}
+              {meta.tagline && (
+                <div
+                  style={{
+                    marginTop: 6,
+                    fontSize: 12,
+                    color: '#9ca3af',
+                  }}
+                >
+                  {meta.tagline}
+                </div>
+              )}
             </div>
 
             {/* Messages */}
@@ -454,6 +563,17 @@ export default function Room() {
                 <b style={{ fontSize: 16 }}>
                   {personas[activePersona] || personas[0]}
                 </b>
+                {mode === 'pair' && (
+                  <span
+                    style={{
+                      fontSize: 11,
+                      color: '#9ca3af',
+                      marginLeft: 6,
+                    }}
+                  >
+                    (pair mode)
+                  </span>
+                )}
               </div>
 
               <div
@@ -463,7 +583,7 @@ export default function Room() {
                 <input
                   placeholder={
                     canType
-                      ? 'Type your message… (say "Asema, ..." to ask her)'
+                      ? 'Type your message… (say “Asema, …” to ask her something)'
                       : 'Input locked in this phase'
                   }
                   value={text}
@@ -484,6 +604,20 @@ export default function Room() {
                 Send
               </button>
             </div>
+
+            {/* Stage hint */}
+            {meta.hint && (
+              <div
+                className="stage-hint"
+                style={{
+                  marginTop: 6,
+                  fontSize: 11,
+                  color: '#9ca3af',
+                }}
+              >
+                {meta.hint}
+              </div>
+            )}
           </div>
 
           {/* Idea Sidebar (Discovery / Idea Dump / Planning) */}
@@ -536,7 +670,7 @@ export default function Room() {
                   ? `Topic: ${roomMeta.topic}`
                   : voteTopic
                   ? `Topic: ${voteTopic}`
-                  : 'No topic selected'}
+                  : 'No topic selected yet'}
               </div>
             </>
           )}
