@@ -6,18 +6,41 @@ export default function CountdownRing({ secondsLeft = 0, secondsTotal = 1 }) {
   const stroke = 4;
   const C = 2 * Math.PI * radius;
 
-  // Clamp 0–1
-  const pct = Math.max(0, Math.min(1, secondsLeft / Math.max(1, secondsTotal)));
+  const safeTotal = Math.max(1, secondsTotal);
+  const clampedLeft = Math.max(0, Math.floor(secondsLeft));
+  const pct = Math.max(0, Math.min(1, clampedLeft / safeTotal));
 
-  // Compute stroke dash array
-  const dash = useMemo(() => `${C * pct} ${C * (1 - pct)}`, [C, pct]);
-  const secs = Math.max(0, Math.floor(secondsLeft));
+  // Stroke dash
+  const dash = useMemo(
+    () => `${C * pct} ${C * (1 - pct)}`,
+    [C, pct]
+  );
+
+  // Format as mm:ss
+  const label = useMemo(() => {
+    const mins = Math.floor(clampedLeft / 60);
+    const secs = clampedLeft % 60;
+    if (safeTotal <= 60) {
+      // Short phases: just show seconds
+      return `${clampedLeft}s`;
+    }
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  }, [clampedLeft, safeTotal]);
+
+  // Urgency coloring
+  const urgency = clampedLeft / safeTotal;
+  let ringColor = '#5BE49B'; // green-ish
+  if (urgency <= 0.4 && urgency > 0.15) {
+    ringColor = '#F5C673'; // amber
+  } else if (urgency <= 0.15) {
+    ringColor = '#F97373'; // red-ish
+  }
 
   return (
     <div
       className="ring"
-      title={`${secs}s remaining`}
-      aria-label={`Time remaining: ${secs} seconds`}
+      title={`${clampedLeft}s remaining`}
+      aria-label={`Time remaining: ${clampedLeft} seconds`}
       style={{
         position: 'relative',
         width: 42,
@@ -27,7 +50,12 @@ export default function CountdownRing({ secondsLeft = 0, secondsTotal = 1 }) {
         justifyContent: 'center',
       }}
     >
-      <svg width="42" height="42" style={{ transform: 'rotate(-90deg)' }}>
+      <svg
+        width="42"
+        height="42"
+        style={{ transform: 'rotate(-90deg)' }}
+      >
+        {/* Background track */}
         <circle
           cx="21"
           cy="21"
@@ -36,25 +64,20 @@ export default function CountdownRing({ secondsLeft = 0, secondsTotal = 1 }) {
           strokeWidth={stroke}
           fill="none"
         />
+        {/* Active arc */}
         <circle
           cx="21"
           cy="21"
           r={radius}
-          stroke="url(#gold-gradient)"
+          stroke={ringColor}
           strokeWidth={stroke}
           fill="none"
           strokeLinecap="round"
           strokeDasharray={dash}
           style={{
-            transition: 'stroke-dasharray 0.3s linear',
+            transition: 'stroke-dasharray 0.3s linear, stroke 0.25s ease-out',
           }}
         />
-        <defs>
-          <linearGradient id="gold-gradient" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stopColor="#f0c86b" />
-            <stop offset="100%" stopColor="#ffefb6" />
-          </linearGradient>
-        </defs>
       </svg>
 
       <div
@@ -65,9 +88,10 @@ export default function CountdownRing({ secondsLeft = 0, secondsTotal = 1 }) {
           fontWeight: 600,
           color: '#fff',
           userSelect: 'none',
+          letterSpacing: 0.4,
         }}
       >
-        {secs}s
+        {label}
       </div>
     </div>
   );

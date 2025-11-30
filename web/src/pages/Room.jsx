@@ -20,44 +20,76 @@ const TOTAL_BY_STAGE = {
   FINAL: 360,
 };
 
-// Friendly labels + guidance per stage
-const STAGE_META = {
-  LOBBY: {
-    label: 'Lobby',
-    tagline: 'Welcome in. Say hello and get comfortable with your group.',
-    hint: 'Share names (if you want), pronouns, or vibes. Get used to typing before things get busy.',
-  },
-  DISCOVERY: {
-    label: 'Discovery',
-    tagline: 'Name the issue before you fix it.',
-    hint: 'Drop real-world stories, observations, and questions about the issue. No need to be perfect.',
-  },
-  IDEA_DUMP: {
-    label: 'Idea Dump',
-    tagline: 'Flood the room with raw ideas.',
-    hint: 'Short, messy ideas are perfect here. Type fast; let Asema help sort it later.',
-  },
-  PLANNING: {
-    label: 'Planning',
-    tagline: 'Turn the mess into a plan.',
-    hint: 'Group similar ideas, pick a central angle, and decide what belongs in your final abstract.',
-  },
-  ROUGH_DRAFT: {
-    label: 'Rough Draft',
-    tagline: 'Shape your first draft with Asema.',
-    hint: 'Ask Asema to revise, cut, or expand. You can still chat and suggest edits together.',
-  },
-  EDITING: {
-    label: 'Editing',
-    tagline: 'Tighten the language and sharpen the story.',
-    hint: 'Fix confusing parts, clarify the main point, and make sure the abstract sounds like your group.',
-  },
-  FINAL: {
-    label: 'Final',
-    tagline: 'Lock in the version you want to share.',
-    hint: 'Do last tweaks. When ready, type “done” or “submit” in the chat and tell your facilitator.',
-  },
+// Small helper for mm:ss display in status strip
+function formatTime(seconds) {
+  const s = Math.max(0, Math.floor(seconds || 0));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, '0')}`;
+}
+
+// Quick legend text for each stage
+const STAGE_DESCRIPTIONS = {
+  LOBBY: 'Everyone lands, tests chat, and gets oriented.',
+  DISCOVERY: 'Share first thoughts and stories about the topic.',
+  IDEA_DUMP: 'Rapid-fire ideas; volume over perfection.',
+  PLANNING: 'Group chooses a focus and rough structure.',
+  ROUGH_DRAFT: 'Asema drafts a first version from your ideas.',
+  EDITING: 'Team revises, sharpens, and corrects the draft.',
+  FINAL: 'Final touches and “we’re done” check-in.',
 };
+
+function StageLegendPill({ stage, open, onToggle }) {
+  const niceStage = (stage || 'LOBBY').replace('_', ' ');
+  return (
+    <div className="stage-legend-pill">
+      <button
+        type="button"
+        className="stage-legend-trigger"
+        onClick={onToggle}
+        aria-expanded={open}
+        aria-label="Show stage legend"
+      >
+        <span className="stage-legend-dot" />
+        <span className="stage-legend-label">
+          {niceStage}
+        </span>
+        <span className="stage-legend-help">?</span>
+      </button>
+
+      {open && (
+        <div className="stage-legend-panel" role="dialog" aria-label="Stage legend">
+          <div className="stage-legend-header">
+            <span className="stage-legend-title">Stage Legend</span>
+            <button
+              type="button"
+              className="stage-legend-close"
+              onClick={onToggle}
+            >
+              ✕
+            </button>
+          </div>
+          <ul className="stage-legend-list">
+            {ORDER.map((s) => (
+              <li key={s}>
+                <span className="stage-legend-stage">
+                  {s.replace('_', ' ')}
+                </span>
+                <span className="stage-legend-desc">
+                  {STAGE_DESCRIPTIONS[s] || ''}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <div className="stage-legend-footer">
+            Tip: this panel is for facilitators if anyone asks,
+            “What are we supposed to be doing right now?”
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Room() {
   const { roomId } = useParams();
@@ -110,6 +142,9 @@ export default function Room() {
 
   // Rough draft local flag: if we already generated one, next click triggers regen
   const [hasDraft, setHasDraft] = useState(false);
+
+  // Legend toggle
+  const [legendOpen, setLegendOpen] = useState(false);
 
   // --- Auth bootstrap ---
   useEffect(() => {
@@ -214,6 +249,8 @@ export default function Room() {
       if (!j.votingOpen) {
         setHasVoted(false);
         setVoteClosesAt(null);
+      } else if (j.voteClosesAt) {
+        setVoteClosesAt(new Date(j.voteClosesAt));
       }
     } catch (e) {
       console.warn('[Room] fetchVoteStatus error', e);
@@ -383,17 +420,15 @@ export default function Room() {
     ? Math.max(0, Math.floor((stageEndsAt.getTime() - nowTick) / 1000))
     : 0;
 
+  const roundIndex = Math.max(1, ORDER.indexOf(stage) + 1 || 1);
+  const roundTotal = ORDER.length;
+  const statusTopic = roomMeta.topic || voteTopic || 'No topic selected yet';
+
   // Input allowed:
   const canType =
     !roomMeta.inputLocked ||
     stage === 'FINAL' ||
     stage === 'ROUGH_DRAFT';
-
-  const meta = STAGE_META[stage] || {
-    label: stage,
-    tagline: '',
-    hint: '',
-  };
 
   return (
     <>
@@ -408,45 +443,19 @@ export default function Room() {
           stage={stage}
         />
 
-        {/* Room identity strip */}
-        <div
-          className="room-identity"
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            marginBottom: 8,
-          }}
-        >
-          <div
-            style={{
-              fontSize: 12,
-              textTransform: 'uppercase',
-              letterSpacing: '0.08em',
-              color: '#9ca3af',
-            }}
-          >
-            Site {roomMeta.siteId || '?'} · Room {roomMeta.index || 1}
-          </div>
-          <div
-            style={{
-              display: 'flex',
-              gap: 4,
-              fontSize: 16,
-            }}
-          >
-            {personas.map((p, i) => (
-              <span key={i}>{p}</span>
-            ))}
-          </div>
-          {roomMeta.topic && (
-            <div
-              className="hud-pill"
-              style={{ marginLeft: 'auto', maxWidth: '50%' }}
-            >
-              Topic: <b>{roomMeta.topic}</b>
-            </div>
-          )}
+        {/* NEW: compact status strip for facilitators & participants */}
+        <div className="status-strip">
+          <span className="status-chip">
+            Round <b>{roundIndex}</b> of <b>{roundTotal}</b>
+          </span>
+          <span className="status-dot">•</span>
+          <span className="status-chip">
+            Time left: <b>{formatTime(secsLeft)}</b>
+          </span>
+          <span className="status-dot">•</span>
+          <span className="status-topic" title={statusTopic}>
+            Topic: <b>{statusTopic}</b>
+          </span>
         </div>
 
         <div
@@ -464,69 +473,46 @@ export default function Room() {
           {/* Chat card */}
           <div className="chat">
             {/* Header */}
-            <div className="chat-head" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+            <div className="chat-head">
+              <span className="stage-badge">{stage}</span>
+              <div className="ribbon" style={{ marginLeft: 10 }}>
+                {ORDER.map((s) => (
+                  <span
+                    key={s}
+                    className={s === stage ? 'on' : ''}
+                  >
+                    {s}
+                  </span>
+                ))}
+              </div>
+
               <div
                 style={{
+                  marginLeft: 'auto',
                   display: 'flex',
                   alignItems: 'center',
                   gap: 10,
                 }}
               >
-                <span className="stage-badge">
-                  {meta.label.toUpperCase()}
-                </span>
-                <div className="ribbon" style={{ marginLeft: 4 }}>
-                  {ORDER.map((s) => (
-                    <span
-                      key={s}
-                      className={s === stage ? 'on' : ''}
+                <CountdownRing
+                  secondsLeft={secsLeft}
+                  secondsTotal={total}
+                />
+                <div
+                  className="persona-choices"
+                  title="Choose persona"
+                >
+                  {personas.map((p, i) => (
+                    <button
+                      key={i}
+                      className={i === activePersona ? 'active' : ''}
+                      onClick={() => setActivePersona(i)}
                     >
-                      {s}
-                    </span>
+                      {p}
+                    </button>
                   ))}
                 </div>
-
-                <div
-                  style={{
-                    marginLeft: 'auto',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 10,
-                  }}
-                >
-                  <CountdownRing
-                    secondsLeft={secsLeft}
-                    secondsTotal={total}
-                  />
-                  <div
-                    className="persona-choices"
-                    title="Choose persona"
-                  >
-                    {personas.map((p, i) => (
-                      <button
-                        key={i}
-                        className={i === activePersona ? 'active' : ''}
-                        onClick={() => setActivePersona(i)}
-                      >
-                        {p}
-                      </button>
-                    ))}
-                  </div>
-                </div>
               </div>
-
-              {/* Stage tagline */}
-              {meta.tagline && (
-                <div
-                  style={{
-                    marginTop: 6,
-                    fontSize: 12,
-                    color: '#9ca3af',
-                  }}
-                >
-                  {meta.tagline}
-                </div>
-              )}
             </div>
 
             {/* Messages */}
@@ -563,17 +549,6 @@ export default function Room() {
                 <b style={{ fontSize: 16 }}>
                   {personas[activePersona] || personas[0]}
                 </b>
-                {mode === 'pair' && (
-                  <span
-                    style={{
-                      fontSize: 11,
-                      color: '#9ca3af',
-                      marginLeft: 6,
-                    }}
-                  >
-                    (pair mode)
-                  </span>
-                )}
               </div>
 
               <div
@@ -583,7 +558,7 @@ export default function Room() {
                 <input
                   placeholder={
                     canType
-                      ? 'Type your message… (say “Asema, …” to ask her something)'
+                      ? 'Type your message… (say "Asema, ..." to ask her)'
                       : 'Input locked in this phase'
                   }
                   value={text}
@@ -604,20 +579,6 @@ export default function Room() {
                 Send
               </button>
             </div>
-
-            {/* Stage hint */}
-            {meta.hint && (
-              <div
-                className="stage-hint"
-                style={{
-                  marginTop: 6,
-                  fontSize: 11,
-                  color: '#9ca3af',
-                }}
-              >
-                {meta.hint}
-              </div>
-            )}
           </div>
 
           {/* Idea Sidebar (Discovery / Idea Dump / Planning) */}
@@ -670,7 +631,7 @@ export default function Room() {
                   ? `Topic: ${roomMeta.topic}`
                   : voteTopic
                   ? `Topic: ${voteTopic}`
-                  : 'No topic selected yet'}
+                  : 'No topic selected'}
               </div>
             </>
           )}
@@ -902,6 +863,13 @@ export default function Room() {
           </div>
         </div>
       )}
+
+      {/* NEW: Floating Stage Legend pill (bottom-left) */}
+      <StageLegendPill
+        stage={stage}
+        open={legendOpen}
+        onToggle={() => setLegendOpen((o) => !o)}
+      />
     </>
   );
 }
