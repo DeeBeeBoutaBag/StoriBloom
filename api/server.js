@@ -1,5 +1,8 @@
-// /opt/StoriBloom/api/server.js
-import 'dotenv/config';
+try {
+  await import('dotenv/config');
+} catch (err) {
+  console.warn('[dotenv] not loaded (probably running on AWS with real env vars):', err?.message || err);
+}
 import express from 'express';
 import cors from 'cors';
 import path from 'node:path';
