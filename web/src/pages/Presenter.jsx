@@ -1,19 +1,11 @@
 // web/src/pages/Presenter.jsx
-
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import { useParams } from 'react-router-dom';
 import { ensureGuest, authHeaders, API_BASE } from '../api.js';
+import PresenterHUD from '../components/PresenterHUD.jsx';
+import PresenterVotingPanel from '../components/PresenterVotingPanel.jsx';
 
-/**
- * Presenter HUD
- * - Enter your Site ID (persisted in sessionStorage, seeded from URL param)
- * - Lists rooms for that site
- * - Controls per-room: Next, +2m, Redo, Lock/Unlock input
- * - Voting controls (Start, Close/Lock)
- * - Live status: stage, seats, topic, inputLocked, vote status
- */
-
-const STAGE_ORDER = [
+const STAGES = [
   'LOBBY',
   'DISCOVERY',
   'IDEA_DUMP',
@@ -23,20 +15,9 @@ const STAGE_ORDER = [
   'FINAL',
 ];
 
-const STAGE_DESCRIPTIONS = {
-  LOBBY: 'Participants arriving, testing chat, and picking emojis.',
-  DISCOVERY: 'Surfacing lived experiences and issues that matter.',
-  IDEA_DUMP: 'Rapid-fire ideas, no judging, just adding to the pile.',
-  PLANNING: 'Choosing the angle, character, and story arc together.',
-  ROUGH_DRAFT: 'Asema + group co-writing the first version.',
-  EDITING: 'Tightening language, structure, and voice as a team.',
-  FINAL: 'Polishing the abstract so it’s ready to share back.',
-};
-
 function useSiteIdFromUrl() {
   const { siteId: siteIdParam } = useParams();
   const [siteId, setSiteId] = useState(() => {
-    // Prefer URL param on first load, then fall back to sessionStorage
     const fromUrl = (siteIdParam || '').toUpperCase();
     if (fromUrl) {
       sessionStorage.setItem('presenter_siteId', fromUrl);
@@ -45,7 +26,6 @@ function useSiteIdFromUrl() {
     return (sessionStorage.getItem('presenter_siteId') || '').toUpperCase();
   });
 
-  // Persist on changes typed by the user
   useEffect(() => {
     if (siteId) {
       sessionStorage.setItem('presenter_siteId', siteId.toUpperCase());
@@ -57,144 +37,109 @@ function useSiteIdFromUrl() {
 
 export default function Presenter() {
   const [siteId, setSiteId] = useSiteIdFromUrl();
-  const [rooms, setRooms] = useState([]); // [{id, index, stage, inputLocked, topic, seats, vote:{open,total}}]
+  const [rooms, setRooms] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [lastRefreshed, setLastRefreshed] = useState(null);
+  const [error, setError] = useState('');
 
-  // Require a non-empty siteId to fetch
   const canFetch = useMemo(
     () => !!(siteId && siteId.trim().length),
     [siteId]
   );
 
-  // auth bootstrap (get a guest token once)
+  // ── Auth bootstrap ──────────────────────────────────────────────────────
   useEffect(() => {
-    ensureGuest().catch(() => {});
+    ensureGuest().catch((e) => console.warn('[Presenter] ensureGuest failed', e));
   }, []);
 
-  // polling rooms list
-  useEffect(() => {
+  // ── Fetch rooms list ────────────────────────────────────────────────────
+  const loadRooms = useCallback(async () => {
     if (!canFetch) return;
-    let mounted = true;
+    setLoading(true);
+    setError('');
+    try {
+      const url = new URL(`${API_BASE}/presenter/rooms`, window.location.origin);
+      url.searchParams.set('siteId', siteId.toUpperCase());
 
-    async function load() {
-  setLoading(true);
-  try {
-    // Use API_BASE directly; new URL is fine but not required
-    const url = `${API_BASE}/presenter/rooms?siteId=${encodeURIComponent(
-      siteId.toUpperCase()
-    )}`;
+      // IMPORTANT: spread authHeaders so headers/credentials are correct
+      const res = await fetch(url.toString(), {
+        ...(await authHeaders()),
+      });
 
-    // IMPORTANT: pass authHeaders() as the full init object,
-    // just like in Room.jsx, not as "headers: ..."
-    const res = await fetch(url, await authHeaders());
-    if (!res.ok) throw new Error('rooms fetch failed');
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.error || `rooms fetch failed (${res.status})`);
+      }
 
-    const j = await res.json();
-    if (!mounted) return;
-
-    const next = Array.isArray(j.rooms) ? j.rooms : [];
-    setRooms(next);
-  } catch (err) {
-    console.error('[Presenter] rooms load error:', err);
-    if (mounted) setRooms([]);
-  } finally {
-    if (mounted) setLoading(false);
-  }
-}
-
-
-    load();
-    const id = setInterval(load, 2500);
-    return () => {
-      mounted = false;
-      clearInterval(id);
-    };
+      const j = await res.json();
+      const list = Array.isArray(j.rooms) ? j.rooms : [];
+      setRooms(list);
+    } catch (err) {
+      console.error('[Presenter] rooms load error:', err);
+      setRooms([]);
+      setError(err.message || 'Could not load rooms.');
+    } finally {
+      setLoading(false);
+    }
   }, [siteId, canFetch]);
 
-  async function post(path, body) {
-    const res = await fetch(`${API_BASE}${path}`, {
-      method: 'POST',
-      headers: await authHeaders(),
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    return res.ok;
-  }
-
-  // hotkeys: Next (N), +2m (= or +), Redo (R) on first room
   useEffect(() => {
-    function onKey(e) {
-      if (!rooms.length) return;
-      const r = rooms[0];
-      if (!r) return;
+    if (!canFetch) return;
+    loadRooms();
+    const id = setInterval(loadRooms, 2500);
+    return () => clearInterval(id);
+  }, [canFetch, loadRooms]);
 
-      if (e.key.toLowerCase() === 'n') next(r.id);
-      if (e.key === '=' || e.key === '+') extend(r.id, 120);
-      if (e.key.toLowerCase() === 'r') redo(r.id);
+  // ── Simple POST helper for controls ─────────────────────────────────────
+  async function post(path, body) {
+    try {
+      const res = await fetch(`${API_BASE}${path}`, {
+        method: 'POST',
+        ...(await authHeaders()),
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.error || `Action failed (${res.status})`);
+      }
+      // let polling pick up new state; no need to do anything here
+      return true;
+    } catch (err) {
+      console.error('[Presenter] action error', err);
+      alert(err.message || 'Action failed');
+      return false;
     }
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+  }
+
+  const next = (roomId) => post(`/rooms/${roomId}/next`);
+  const extend = (roomId, secs = 120) => post(`/rooms/${roomId}/extend`, { by: secs });
+  const redo = (roomId) => post(`/rooms/${roomId}/redo`);
+  const lock = (roomId) => post(`/rooms/${roomId}/lock`, { inputLocked: true });
+  const unlock = (roomId) => post(`/rooms/${roomId}/lock`, { inputLocked: false });
+
+  const startVote = (roomId) => post(`/rooms/${roomId}/vote/start`);
+  const closeVote = (roomId) => post(`/rooms/${roomId}/vote/close`);
+
+  // ── Derived summary for header ──────────────────────────────────────────
+  const stageSummary = useMemo(() => {
+    const byStage = {};
+    for (const s of STAGES) byStage[s] = 0;
+    rooms.forEach((r) => {
+      const s = r.stage || 'LOBBY';
+      if (!byStage[s]) byStage[s] = 0;
+      byStage[s] += 1;
+    });
+    return byStage;
   }, [rooms]);
 
-  async function next(roomId) {
-    await post(`/rooms/${roomId}/next`);
-  }
-  async function extend(roomId, secs = 120) {
-    await post(`/rooms/${roomId}/extend`, { by: secs });
-  }
-  async function redo(roomId) {
-    await post(`/rooms/${roomId}/redo`);
-  }
-  async function lock(roomId) {
-    await post(`/rooms/${roomId}/lock`, { inputLocked: true });
-  }
-  async function unlock(roomId) {
-    await post(`/rooms/${roomId}/lock`, { inputLocked: false });
-  }
-
-  // Voting controls (Discovery)
-  async function startVote(roomId) {
-    await post(`/rooms/${roomId}/vote/start`);
-  }
-  async function closeVote(roomId) {
-    await post(`/rooms/${roomId}/vote/close`);
-  }
-
-  // --- Global helpers / summaries ---
-
-  const stageCounts = useMemo(() => {
-    const counts = {};
-    for (const r of rooms) {
-      const s = r.stage || 'UNKNOWN';
-      counts[s] = (counts[s] || 0) + 1;
-    }
-    return counts;
-  }, [rooms]);
-
-  const totalParticipants = useMemo(() => {
-    return rooms.reduce((acc, r) => {
-      const seats = Number.isFinite(r.seats) ? Number(r.seats) : 0;
-      return acc + seats;
-    }, 0);
-  }, [rooms]);
-
-  const anyVotingOpen = useMemo(
-    () => rooms.some((r) => r.vote && r.vote.open),
+  const estimatedSeats = useMemo(
+    () => rooms.reduce((sum, r) => sum + (Number(r.seats) || 0), 0),
     [rooms]
   );
 
-  async function nextAll() {
-    await Promise.all(rooms.map((r) => next(r.id)));
-  }
-
-  async function extendAll(secs = 120) {
-    await Promise.all(rooms.map((r) => extend(r.id, secs)));
-  }
-
-  function openRoom(roomId) {
-    // Open participant view for debugging / monitoring
-    window.open(`/room/${roomId}`, '_blank', 'noopener,noreferrer');
-  }
+  const sortedRooms = useMemo(
+    () => [...rooms].sort((a, b) => (a.index || 0) - (b.index || 0)),
+    [rooms]
+  );
 
   return (
     <>
@@ -202,262 +147,144 @@ export default function Presenter() {
       <div className="grain" />
 
       <div className="presenter-wrap">
-        {/* Header bar */}
-        <div className="presenter-head glass">
-          <div className="title-block">
-            <div className="title">Presenter HUD</div>
-            <div className="subtitle">
-              Live control panel for{' '}
-              <strong>{siteId || '—'}</strong> rooms.
+        {/* Top header strip */}
+        <header className="presenter-head glass">
+          <div>
+            <div className="presenter-title">Presenter HUD</div>
+            <div className="presenter-subtitle">
+              Live control panel for <b>{siteId || '—'}</b> rooms.
             </div>
           </div>
 
-          <div className="site">
-            <label>Site ID</label>
+          <div className="presenter-site">
+            <label htmlFor="presenter-site-input">SITE ID</label>
             <input
+              id="presenter-site-input"
               value={siteId}
-              onChange={(e) =>
-                setSiteId(e.target.value.toUpperCase())
-              }
-              placeholder="E1 / C1 / W1 etc."
+              onChange={(e) => setSiteId(e.target.value.toUpperCase())}
+              placeholder="E1 / C1 / W1"
             />
           </div>
 
-          <div className="head-meta">
-            <div className="hint">
-              Hotkeys on Room 1:&nbsp;
-              <b>N</b> Next, <b>+</b> +2m, <b>R</b> Redo
-            </div>
-            <div className="status-pill">
-              {loading ? 'Syncing…' : 'Live'}
-              {lastRefreshed && (
-                <span className="status-time">
-                  &nbsp;• Updated at{' '}
-                  {lastRefreshed.toLocaleTimeString()}
-                </span>
-              )}
-            </div>
+          <div className="presenter-meta">
+            <div>Hotkeys on Room 1: <b>N</b> Next, <b>+</b> +2m, <b>R</b> Redo</div>
+            <div>Status: <span className="pill pill-live">{canFetch ? 'Live' : 'Idle'}</span></div>
+            <div>Rooms: <b>{rooms.length}</b></div>
+            <div>Participants: <b>{estimatedSeats}</b></div>
           </div>
+        </header>
 
-          {canFetch && rooms.length > 0 && (
-            <div className="global-controls">
-              <button onClick={nextAll} className="btn small">
-                Next Stage: All Rooms
-              </button>
-              <button
-                onClick={() => extendAll(120)}
-                className="btn small"
-              >
-                +2m: All Rooms
-              </button>
-              <div className="global-summary">
-                <span>
-                  Rooms: <b>{rooms.length}</b>
-                </span>
-                <span>
-                  Est. Participants:{' '}
-                  <b>{totalParticipants || '—'}</b>
-                </span>
-                {anyVotingOpen && (
-                  <span className="pill-warning">
-                    Voting open in one or more rooms
-                  </span>
-                )}
-              </div>
+        {/* Stage summary bar */}
+        <section className="presenter-stage-strip glass">
+          {STAGES.map((s) => (
+            <div key={s} className="presenter-stage-pill">
+              <span>{s.replace('_', ' ')}</span>
+              <b>{stageSummary[s] || 0}</b>
+              <span className="presenter-stage-label">rooms</span>
             </div>
-          )}
-        </div>
+          ))}
+        </section>
 
-        {/* Stage overview chips */}
-        {canFetch && rooms.length > 0 && (
-          <div className="stage-overview glass">
-            {STAGE_ORDER.map((s) => (
-              <div
-                key={s}
-                className={`stage-chip ${
-                  stageCounts[s] ? 'active' : ''
-                }`}
-              >
-                <span className="stage-name">{s}</span>
-                <span className="stage-count">
-                  {stageCounts[s] || 0} rooms
-                </span>
-              </div>
-            ))}
+        {/* Error / empty */}
+        {error && (
+          <div className="presenter-empty glass">
+            {error}
           </div>
         )}
 
-        {!canFetch && (
-          <div className="empty glass">
-            Enter a Site ID above to load active rooms.
+        {!error && !loading && canFetch && rooms.length === 0 && (
+          <div className="presenter-empty glass">
+            No rooms returned for site <b>{siteId}</b>.<br />
+            Check that your codes point to this site ID and that
+            <code> /presenter/rooms?siteId={siteId}</code> is returning rooms.
           </div>
         )}
 
-        {canFetch && (
-          <div className="rooms-grid">
-            {loading && (
-              <div className="loading">Loading rooms…</div>
-            )}
-
-            {rooms.map((r) => {
-              const stage = r.stage || 'LOBBY';
-              const desc =
-                STAGE_DESCRIPTIONS[stage] ||
-                'Stage in progress.';
-
-              return (
-                <div
-                  key={r.id}
-                  className="room-card glass"
-                >
-                  {/* Card header */}
-                  <div className="head">
-                    <div className="id">
-                      Room {r.index}{' '}
-                      <span className="site-tag">
-                        {siteId}
-                      </span>
-                    </div>
-                    <div
-                      className={`stage badge ${
-                        stage.toLowerCase() || 'unknown'
-                      }`}
-                    >
-                      {stage}
-                    </div>
-                  </div>
-
-                  {/* Stage description */}
-                  <div className="stage-desc">
-                    {desc}
-                  </div>
-
-                  {/* Meta row */}
-                  <div className="meta">
-                    <div>
-                      <span className="label">
-                        Seats
-                      </span>{' '}
-                      {r.seats ?? '—'}
-                    </div>
-                    <div>
-                      <span className="label">
-                        Locked
-                      </span>{' '}
-                      {r.inputLocked ? 'Yes' : 'No'}
-                    </div>
-                    <div>
-                      <span className="label">
-                        Topic
-                      </span>{' '}
-                      {r.topic || '—'}
-                    </div>
-                  </div>
-
-                  {/* Voting status */}
-                  {r.vote && (
-                    <div className="vote meta">
-                      <div>
-                        <span className="label">
-                          Voting
-                        </span>{' '}
-                        {r.vote.open ? 'Open' : 'Closed'}
-                      </div>
-                      <div>
-                        <span className="label">
-                          Ballots
-                        </span>{' '}
-                        {r.vote.total ?? 0}
-                      </div>
-                      {r.vote.tallies && (
-                        <details>
-                          <summary>Tallies</summary>
-                          <ul className="mini">
-                            {Object.entries(
-                              r.vote.tallies
-                            ).map(([k, v]) => (
-                              <li key={k}>
-                                #{k}: {v}
-                              </li>
-                            ))}
-                          </ul>
-                        </details>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Controls row 1: stage / time / lock */}
-                  <div className="controls">
-                    <button
-                      onClick={() => next(r.id)}
-                    >
-                      Next
-                    </button>
-                    <button
-                      onClick={() => extend(r.id, 120)}
-                    >
-                      +2m
-                    </button>
-                    <button
-                      onClick={() => redo(r.id)}
-                    >
-                      Redo
-                    </button>
-                    <button
-                      onClick={() => lock(r.id)}
-                      className="warn"
-                    >
-                      Lock
-                    </button>
-                    <button
-                      onClick={() => unlock(r.id)}
-                      className="safe"
-                    >
-                      Unlock
-                    </button>
-                  </div>
-
-                  {/* Controls row 2: voting + open room */}
-                  <div className="controls">
-                    <button
-                      onClick={() => startVote(r.id)}
-                    >
-                      Start Voting
-                    </button>
-                    <button
-                      onClick={() => closeVote(r.id)}
-                      className="warn"
-                    >
-                      Close &amp; Lock Topic
-                    </button>
-                    <button
-                      onClick={() => openRoom(r.id)}
-                      className="ghost"
-                    >
-                      Open Room View
-                    </button>
+        {/* Rooms grid */}
+        <main className="rooms-grid">
+          {sortedRooms.map((r) => (
+            <article key={r.id} className="room-card glass">
+              <header className="room-card-head">
+                <div>
+                  <div className="room-card-title">Room {r.index} {siteId}</div>
+                  <div className="room-card-sub">
+                    {r.stage === 'LOBBY'
+                      ? 'Waiting for participants.'
+                      : 'Stage in progress.'}
                   </div>
                 </div>
-              );
-            })}
 
-            {!loading && rooms.length === 0 && (
-              <div className="empty glass">
-                No rooms returned for site{' '}
-                <b>{siteId}</b>.
-                <br />
-                Check that your codes are pointing to
-                this site ID and that the backend
-                endpoint{' '}
-                <code>
-                  /presenter/rooms?siteId={siteId}
-                </code>{' '}
-                is returning rooms.
-              </div>
-            )}
-          </div>
-        )}
+                <div className="room-card-stage">
+                  <span className="pill pill-stage">{r.stage || '—'}</span>
+                  <span className="pill pill-status">{r.closed ? 'CLOSED' : 'OPEN'}</span>
+                </div>
+              </header>
+
+              <section className="room-card-meta">
+                <div><span className="label">Seats</span> {r.seats ?? '—'}</div>
+                <div><span className="label">Locked</span> {r.inputLocked ? 'Yes' : 'No'}</div>
+                <div className="room-card-topic">
+                  <span className="label">Topic</span> {r.topic || '—'}
+                </div>
+              </section>
+
+              {r.vote && (
+                <section className="room-card-vote">
+                  <div><span className="label">Voting</span> {r.vote.open ? 'Open' : 'Closed'}</div>
+                  <div><span className="label">Ballots</span> {r.vote.total ?? 0}</div>
+                  {r.vote.tallies && (
+                    <details>
+                      <summary> Tallies</summary>
+                      <ul>
+                        {Object.entries(r.vote.tallies).map(([k, v]) => (
+                          <li key={k}>#{k}: {v}</li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
+                </section>
+              )}
+
+              <section className="room-card-controls">
+                <div className="room-card-row">
+                  <button type="button" onClick={() => next(r.id)}>Next</button>
+                  <button type="button" onClick={() => extend(r.id, 120)}>+2m</button>
+                  <button type="button" onClick={() => redo(r.id)}>Redo</button>
+                  <button type="button" onClick={() => lock(r.id)} className="warn">Lock</button>
+                  <button type="button" onClick={() => unlock(r.id)} className="safe">Unlock</button>
+                </div>
+
+                <div className="room-card-row">
+                  <button type="button" onClick={() => startVote(r.id)}>Start Voting</button>
+                  <button
+                    type="button"
+                    onClick={() => closeVote(r.id)}
+                    className="warn"
+                  >
+                    Close &amp; Lock Topic
+                  </button>
+                  <a
+                    href={`/room/${r.id}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="room-open-link"
+                  >
+                    Open Room View
+                  </a>
+                </div>
+              </section>
+
+              {/* Optional inline presenter voting panel */}
+              <section className="room-card-voting-panel">
+                <PresenterVotingPanel roomId={r.id} isPresenter />
+              </section>
+            </article>
+          ))}
+        </main>
       </div>
+
+      {/* Floating keyboard-hotkey HUD (bottom-right) */}
+      <PresenterHUD siteId={siteId} rooms={sortedRooms} />
     </>
   );
 }
