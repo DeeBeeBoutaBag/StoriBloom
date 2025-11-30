@@ -27,7 +27,7 @@ import { Asema } from './asemaPersona.js';
 import { createStageEngine } from './stageEngine.js';
 
 // ---------- ENV ----------
-const PORT = Number(process.env.PORT || 4000);
+const PORT = Number(process.env.PORT || 8080);
 const AWS_REGION = process.env.AWS_REGION || 'us-west-2';
 const AWS_DYNAMO_ENDPOINT = process.env.AWS_DYNAMO_ENDPOINT || undefined;
 
