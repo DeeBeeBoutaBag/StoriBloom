@@ -105,6 +105,19 @@ export default function Login() {
       <div className="scanlines" />
       <div className="grain" />
 
+      {/* Top site header */}
+      <div className="site-header">
+        <div className="site-header-left">
+          <span className="site-logo">🌸</span>
+          <span className="site-title">Asema Academy</span>
+        </div>
+        <div className="site-header-right">
+          <span className="site-tagline">
+            Unmasking AI — one story at a time.
+          </span>
+        </div>
+      </div>
+
       <div className="center-wrap">
         <motion.div
           ref={cardRef}
@@ -120,15 +133,15 @@ export default function Login() {
         >
           <div className="brand">
             <div className="brand-badge tilt-raise-sm">
-              ACCESS: GRANTED
+              SESSION ACCESS
             </div>
             <div className="brand-title tilt-raise">
               StoriBloom.AI
             </div>
           </div>
           <div className="brand-sub tilt-raise-sm">
-            Classified Collaboration Console — Enter your
-            session code to proceed.
+            Live AI collaboration for your site. Enter the session
+            code from your facilitator to join your group.
           </div>
 
           <div className="mt16">
@@ -139,6 +152,15 @@ export default function Login() {
               }}
             >
               SESSION CODE
+              <span
+                style={{
+                  fontSize: 11,
+                  color: '#9aa0a6',
+                  marginLeft: 6,
+                }}
+              >
+                (On your handout or screen)
+              </span>
             </label>
             <input
               className="input mt6"
@@ -173,7 +195,7 @@ export default function Login() {
               }}
             >
               You’ll appear anonymous, identified by
-              your emoji.
+              your emoji only.
             </div>
           </div>
 
@@ -231,7 +253,7 @@ export default function Login() {
               onClick={submit}
               disabled={busy}
             >
-              {busy ? 'Entering…' : 'Enter StoriBloom'}
+              {busy ? 'Entering…' : 'Enter Session'}
             </button>
             <div
               style={{
@@ -255,11 +277,43 @@ export default function Login() {
               color: '#7b818a',
             }}
           >
-            Proceeding implies acceptance of
-            session guidelines. Unauthorized access
-            will be logged.
+            Proceeding implies acceptance of session
+            guidelines. Unauthorized access will be logged.
           </div>
         </motion.div>
+
+        {/* How it works strip */}
+        <div className="login-how-it-works">
+          <div className="step">
+            <div className="step-num">1</div>
+            <div className="step-body">
+              <div className="step-title">Enter your code</div>
+              <div className="step-text">
+                Use the session code your facilitator shared for your
+                site and time slot.
+              </div>
+            </div>
+          </div>
+          <div className="step">
+            <div className="step-num">2</div>
+            <div className="step-body">
+              <div className="step-title">Choose your emoji</div>
+              <div className="step-text">
+                Your emoji is your identity. No names, just vibes and ideas.
+              </div>
+            </div>
+          </div>
+          <div className="step">
+            <div className="step-num">3</div>
+            <div className="step-body">
+              <div className="step-title">Build with Asema</div>
+              <div className="step-text">
+                Join your group room and co-create a story or abstract
+                with AI as your collaborator.
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <EmojiDrawer
