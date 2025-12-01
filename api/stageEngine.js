@@ -15,9 +15,10 @@
  * - updateRoom(roomId, patch)
  * - advanceStageVal(currentStage)
  * - onStageAdvanced?(updatedRoom)
+ * - getMaxStageForRoom?(room) -> string stage name (e.g., 'FINAL') at which we should close the room
  */
 
-const TICK_MS = 5_000;           // how often to check
+const TICK_MS = 5_000;            // how often to check
 const TOUCH_TTL_MS = 30 * 60_000; // stop tracking room if idle 30m
 
 // Central place for durations (ms)
@@ -36,9 +37,18 @@ function getDurationForStage(stage) {
   return STAGE_DURATIONS[stage] || 6 * 60_000;
 }
 
-export function createStageEngine({ getRoom, updateRoom, advanceStageVal, onStageAdvanced }) {
-  // roomId -> lastTouch
+export function createStageEngine({
+  getRoom,
+  updateRoom,
+  advanceStageVal,
+  onStageAdvanced,
+  getMaxStageForRoom, // optional: (room) => 'FINAL' | 'EDITING' | ...
+}) {
+  // roomId -> lastTouch timestamp
   const hot = new Map();
+
+  let interval = null;
+  let ticking = false;
 
   function touch(roomId) {
     if (!roomId) return;
@@ -48,6 +58,7 @@ export function createStageEngine({ getRoom, updateRoom, advanceStageVal, onStag
   async function handleRoom(roomId, now) {
     const lastTouch = hot.get(roomId);
     if (!lastTouch || now - lastTouch > TOUCH_TTL_MS) {
+      // Room has gone cold – stop tracking
       hot.delete(roomId);
       return;
     }
@@ -58,38 +69,67 @@ export function createStageEngine({ getRoom, updateRoom, advanceStageVal, onStag
       return;
     }
 
-    const stage = room.stage || 'LOBBY';
-    if (stage === 'CLOSED') return;
+    const stage = room.stage || "LOBBY";
+    if (stage === "CLOSED") {
+      // Once closed, we can drop it from tracking
+      hot.delete(roomId);
+      return;
+    }
 
     // Normalize stageEndsAt → timestamp
     let endsAtMs = 0;
-    if (typeof room.stageEndsAt === 'number') {
+    if (typeof room.stageEndsAt === "number") {
       endsAtMs = room.stageEndsAt;
     } else if (room.stageEndsAt instanceof Date) {
       endsAtMs = room.stageEndsAt.getTime();
     } else if (room.stageEndsAt) {
       const d = new Date(room.stageEndsAt);
-      if (!isNaN(d.getTime())) endsAtMs = d.getTime();
+      if (!Number.isNaN(d.getTime())) endsAtMs = d.getTime();
     }
 
-    // If no stageEndsAt yet, set it based on current stage
+    // If no stageEndsAt yet, set it based on current stage (initialization only).
+    // NOTE: we intentionally DO NOT call onStageAdvanced here — this is not a real "advance",
+    // just fixing missing timers.
     if (!endsAtMs) {
       const dur = getDurationForStage(stage);
-      const updated = await updateRoom(roomId, {
+      await updateRoom(roomId, {
         stage,
         stageEndsAt: now + dur,
       });
-      if (onStageAdvanced && updated) {
-        // Treat as "initialized" rather than advanced
-        await onStageAdvanced(updated);
-      }
       return;
     }
 
     // If it's not time yet, do nothing
     if (now < endsAtMs) return;
 
-    // Time's up → advance
+    // ---- Per-room max stage handling ----
+    let maxStage = null;
+    if (typeof getMaxStageForRoom === "function") {
+      try {
+        maxStage = getMaxStageForRoom(room) || null;
+      } catch (err) {
+        console.error("[stageEngine] getMaxStageForRoom error for", roomId, err);
+      }
+    }
+
+    // If this room has a maxStage and we're at it, closing logic:
+    if (maxStage && stage === maxStage) {
+      const updated = await updateRoom(roomId, {
+        stage: "CLOSED",
+        stageEndsAt: now, // mark as ended now
+      });
+
+      // Stop tracking once closed
+      hot.delete(roomId);
+
+      if (onStageAdvanced && updated) {
+        // Treat moving into CLOSED as a final "advanced" event
+        await onStageAdvanced(updated);
+      }
+      return;
+    }
+
+    // Time's up → normal advance
     const nextStage = advanceStageVal(stage);
     if (!nextStage || nextStage === stage) return;
 
@@ -102,31 +142,59 @@ export function createStageEngine({ getRoom, updateRoom, advanceStageVal, onStag
     if (onStageAdvanced && updated) {
       await onStageAdvanced(updated);
     }
+
+    // If we advanced into CLOSED (based on your ROOM_ORDER/advanceStageVal),
+    // drop from hot after notifying.
+    if (updated.stage === "CLOSED") {
+      hot.delete(roomId);
+    }
   }
 
   async function tick() {
-    const now = Date.now();
-    const ids = Array.from(hot.keys());
-    if (!ids.length) return;
+    if (ticking) return; // prevent overlapping ticks under load
+    ticking = true;
+    try {
+      const now = Date.now();
+      const ids = Array.from(hot.keys());
+      if (!ids.length) return;
 
-    for (const roomId of ids) {
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        await handleRoom(roomId, now);
-      } catch (err) {
-        console.error('[stageEngine] tick error for', roomId, err);
+      // Process rooms sequentially to avoid hammering DynamoDB
+      for (const roomId of ids) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await handleRoom(roomId, now);
+        } catch (err) {
+          console.error("[stageEngine] tick error for", roomId, err);
+        }
       }
+    } finally {
+      ticking = false;
     }
   }
 
   function start() {
-    setInterval(() => {
-      tick().catch((err) => console.error('[stageEngine] unhandled tick error', err));
+    if (interval) return;
+    interval = setInterval(() => {
+      tick().catch((err) =>
+        console.error("[stageEngine] unhandled tick error", err)
+      );
     }, TICK_MS);
-    console.log('[stageEngine] started with durations:', STAGE_DURATIONS);
+    if (typeof interval.unref === "function") {
+      // Don’t keep the Node process alive solely because of the engine
+      interval.unref();
+    }
+    console.log("[stageEngine] started with durations:", STAGE_DURATIONS);
   }
 
-  return { touch, start };
+  function stop() {
+    if (interval) {
+      clearInterval(interval);
+      interval = null;
+      console.log("[stageEngine] stopped");
+    }
+  }
+
+  return { touch, start, stop };
 }
 
 // Also export durations if you ever want to reuse in server.js

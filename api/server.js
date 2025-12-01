@@ -211,7 +211,7 @@ async function ensureRoom(roomId) {
     voteTotal: 0,
     voteTallies: {},
     greetedForStage: {},
-    seats: [], // new: track occupancy
+    seats: [], // track occupancy
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
@@ -310,6 +310,8 @@ async function generateRoughDraftForRoom(room, { force = false } = {}) {
     const draft = (text || '').trim();
     const createdAt = Date.now();
 
+    const prev = await getLatestDraft(room.roomId);
+
     await ddbDoc.send(
       new PutCommand({
         TableName: TABLES.drafts,
@@ -317,7 +319,7 @@ async function generateRoughDraftForRoom(room, { force = false } = {}) {
           roomId: room.roomId,
           createdAt,
           content: draft,
-          version: (await getLatestDraft(room.roomId)) ? 2 : 1,
+          version: prev ? (prev.version || 1) + 1 : 1,
         },
       })
     );
@@ -339,6 +341,8 @@ async function generateRoughDraftForRoom(room, { force = false } = {}) {
       'Draft unavailable due to an AI error. Continue discussing your 250-word abstract together.';
     const createdAt = Date.now();
 
+    const prev = await getLatestDraft(room.roomId);
+
     await ddbDoc.send(
       new PutCommand({
         TableName: TABLES.drafts,
@@ -346,7 +350,7 @@ async function generateRoughDraftForRoom(room, { force = false } = {}) {
           roomId: room.roomId,
           createdAt,
           content: fallback,
-          version: (await getLatestDraft(room.roomId)) ? 2 : 1,
+          version: prev ? (prev.version || 1) + 1 : 1,
         },
       })
     );
@@ -443,7 +447,6 @@ const stageEngine = createStageEngine({
   advanceStageVal,
   onStageAdvanced: async (room) => {
     try {
-      // Nudge only; rough draft is user-triggered
       await addMessage(room.roomId, {
         text: `⏱️ Moving into ${room.stage}. Keep building together and call on me when you’re ready.`,
         phase: room.stage,
@@ -457,6 +460,12 @@ const stageEngine = createStageEngine({
     } catch (e) {
       console.error('[stageEngine onStageAdvanced] error', e);
     }
+  },
+  // 👇 Example: globally cap at FINAL (auto-close after FINAL timer ends)
+  getMaxStageForRoom: (room) => {
+    // You can branch here per site or program later:
+    // if (room.siteId === 'C1') return 'EDITING';
+    return 'FINAL';
   },
 });
 stageEngine.start();
@@ -628,14 +637,37 @@ app.post('/rooms/:roomId/lock', requireAuth, async (req, res) => {
 });
 
 // ---------- Voting ----------
+// Default set of issues (shared with UI conceptually)
+const ISSUE_MAP = {
+  1: 'Law Enforcement Profiling',
+  2: 'Food Deserts',
+  3: 'Red Lining',
+  4: 'Homelessness',
+  5: 'Wealth Gap',
+};
+
 app.get('/rooms/:roomId/vote', requireAuth, async (req, res) => {
   const r = await ensureRoom(req.params.roomId);
   stageEngine.touch(r.roomId);
+
+  const tallies = r.voteTallies || {};
+  const optionEntries = Object.entries(ISSUE_MAP).map(([num, label]) => ({
+    num: Number(num),
+    label,
+  }));
+  const counts = optionEntries.map(({ num }) =>
+    Number.isFinite(Number(tallies[num]))
+      ? Number(tallies[num])
+      : 0
+  );
+
+  const votesReceived = counts.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
+
   res.json({
     votingOpen: !!r.voteOpen,
-    options: [],
-    votesReceived: Number(r.voteTotal || 0),
-    counts: Object.values(r.voteTallies || {}),
+    options: optionEntries,
+    votesReceived,
+    counts,
     topic: r.topic || '',
   });
 });
@@ -654,8 +686,11 @@ app.post('/rooms/:roomId/vote/submit', requireAuth, async (req, res) => {
   }
   const r = await ensureRoom(roomId);
   if (!r.voteOpen) return res.status(400).json({ error: 'voting_closed' });
+
   const tallies = { ...(r.voteTallies || {}) };
-  tallies[choice] = (tallies[choice] || 0) + 1;
+  const key = Number(choice);
+  tallies[key] = (tallies[key] || 0) + 1;
+
   await updateRoom(roomId, {
     voteTallies: tallies,
     voteTotal: Number(r.voteTotal || 0) + 1,
@@ -673,14 +708,8 @@ app.post('/rooms/:roomId/vote/close', requireAuth, async (req, res) => {
   if (entries.length) {
     entries.sort((a, b) => (b[1] || 0) - (a[1] || 0));
     const [winningNum] = entries[0];
-    const ISSUE_MAP = {
-      1: 'Law Enforcement Profiling',
-      2: 'Food Deserts',
-      3: 'Red Lining',
-      4: 'Homelessness',
-      5: 'Wealth Gap',
-    };
-    topic = ISSUE_MAP[Number(winningNum)] || `#${winningNum}`;
+    const label = ISSUE_MAP[Number(winningNum)];
+    topic = label || `#${winningNum}`;
   }
 
   await updateRoom(roomId, { voteOpen: false, topic });
@@ -688,7 +717,8 @@ app.post('/rooms/:roomId/vote/close', requireAuth, async (req, res) => {
 });
 
 // ---------- Idea summarization (Discovery + Idea Dump + Planning) ----------
-const IDEA_MIN_INTERVAL_MS = 8000;
+// Throttle summaries so OpenAI isn't hammered when lots of people type.
+const IDEA_MIN_INTERVAL_MS = 20_000; // 20s per room
 const ideaLastRun = new Map(); // roomId -> timestamp
 
 function shouldRunIdeaSummary(roomId) {
@@ -752,6 +782,18 @@ app.post('/rooms/:roomId/ideas/trigger', requireAuth, async (req, res) => {
 });
 
 // ---------- AI Greeting & Ask ----------
+// Ask throttle so one excited teen can't spam your OpenAI key
+const ASK_MIN_INTERVAL_MS = 4_000; // 4s per room
+const askLastRun = new Map(); // roomId -> timestamp
+
+function shouldRunAsk(roomId) {
+  const now = Date.now();
+  const last = askLastRun.get(roomId) || 0;
+  if (now - last < ASK_MIN_INTERVAL_MS) return false;
+  askLastRun.set(roomId, now);
+  return true;
+}
+
 app.post('/rooms/:roomId/welcome', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const r = await ensureRoom(roomId);
@@ -790,6 +832,17 @@ app.post('/rooms/:roomId/ask', requireAuth, async (req, res) => {
   if (extracted) {
     await updateRoom(roomId, { topic: extracted });
     r = await ensureRoom(roomId);
+  }
+
+  // Throttle actual OpenAI calls per room; still respond with a small hint
+  if (!shouldRunAsk(roomId)) {
+    await addMessage(roomId, {
+      text:
+        'I’m catching up on a few questions — give the room a few seconds before calling on me again.',
+      phase: stage,
+      authorType: 'asema',
+    });
+    return res.json({ ok: true, throttled: true });
   }
 
   try {

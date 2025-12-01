@@ -29,7 +29,16 @@ export class DebounceWorker {
     this.maxWaitMs = maxWaitMs;
     this.map = new Map(); // roomId -> { timer, first, last, running }
     this._destroyed = false;
-    this.log = typeof logger === 'function' ? logger : () => {};
+    this.log =
+      typeof logger === 'function'
+        ? logger
+        : (...args) => {
+            // Quiet by default in production; flip to console.debug if you want traces
+            if (process.env.DEBounce_LOG === '1') {
+              // eslint-disable-next-line no-console
+              console.debug('[DebounceWorker]', ...args);
+            }
+          };
   }
 
   /**
@@ -38,6 +47,8 @@ export class DebounceWorker {
    */
   trigger(roomId) {
     if (this._destroyed) return;
+    if (!roomId) return;
+
     const now = Date.now();
     const state = this.map.get(roomId) || {};
     if (state.timer) clearTimeout(state.timer);
@@ -47,30 +58,33 @@ export class DebounceWorker {
     const elapsed = now - first;
 
     const run = async () => {
-      // Clear scheduled timer before running to avoid duplicate invokes.
+      // If we got destroyed after scheduling, bail.
+      if (this._destroyed) return;
+
       const s = this.map.get(roomId);
       if (!s) return; // canceled meanwhile
-      if (s.running) return; // another run started (rare)
+      if (s.running) return; // another run started (very rare)
+
       s.running = true;
       this.map.set(roomId, s);
 
       try {
         await this.runFn(roomId);
       } catch (e) {
+        // eslint-disable-next-line no-console
         console.error('[DebounceWorker] runFn error for', roomId, e);
       } finally {
-        // Reset state after run; new triggers start a fresh window.
+        // Remove state after run; new triggers start a fresh window.
         this.map.delete(roomId);
+        this.log('completed', roomId);
       }
     };
 
+    // If we've been debouncing for longer than maxWaitMs → force a run soon.
     if (elapsed >= this.maxWaitMs) {
-      this.log('[DebounceWorker] maxWait exceeded → running now', roomId);
-      // Run ASAP
-      // Avoid starving event loop if many rooms burst simultaneously
+      this.log('maxWait exceeded → running now', roomId);
       const t = setTimeout(run, 0);
       if (typeof t.unref === 'function') t.unref();
-      // No need to keep record; run() will handle cleanup
       this.map.set(roomId, { timer: t, first, last, running: false });
       return;
     }
@@ -80,6 +94,7 @@ export class DebounceWorker {
     if (typeof timer.unref === 'function') timer.unref();
 
     this.map.set(roomId, { timer, first, last, running: false });
+    this.log('scheduled', roomId, 'in', wait, 'ms');
   }
 
   /**
@@ -88,34 +103,43 @@ export class DebounceWorker {
    * @returns {boolean} true if something was canceled
    */
   cancel(roomId) {
+    if (!roomId) return false;
     const s = this.map.get(roomId);
     if (!s) return false;
     if (s.timer) clearTimeout(s.timer);
     this.map.delete(roomId);
-    this.log('[DebounceWorker] canceled', roomId);
+    this.log('canceled', roomId);
     return true;
-    }
+  }
 
   /**
    * Immediately run the job for a room if it is pending; otherwise no-op.
    * @param {string} roomId
-   * @returns {Promise<boolean>} true if it flushed and ran (or scheduled 0-delay), false otherwise
+   * @returns {Promise<boolean>} true if it flushed and ran, false otherwise
    */
   async flush(roomId) {
+    if (!roomId) return false;
     const s = this.map.get(roomId);
     if (!s) return false;
     if (s.timer) clearTimeout(s.timer);
 
     // Mark running and call directly to ensure immediate execution
-    this.map.set(roomId, { timer: null, first: s.first, last: s.last, running: true });
+    this.map.set(roomId, {
+      timer: null,
+      first: s.first,
+      last: s.last,
+      running: true,
+    });
+
     try {
       await this.runFn(roomId);
     } catch (e) {
+      // eslint-disable-next-line no-console
       console.error('[DebounceWorker] flush runFn error for', roomId, e);
     } finally {
       this.map.delete(roomId);
     }
-    this.log('[DebounceWorker] flushed', roomId);
+    this.log('flushed', roomId);
     return true;
   }
 
@@ -125,7 +149,14 @@ export class DebounceWorker {
    */
   async flushAll() {
     const ids = Array.from(this.map.keys());
-    await Promise.all(ids.map((id) => this.flush(id).catch(() => {})));
+    await Promise.all(
+      ids.map((id) =>
+        this.flush(id).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[DebounceWorker] flushAll error for', id, e);
+        })
+      )
+    );
   }
 
   /**
@@ -145,6 +176,6 @@ export class DebounceWorker {
       if (s.timer) clearTimeout(s.timer);
       this.map.delete(roomId);
     }
-    this.log('[DebounceWorker] destroyed');
+    this.log('destroyed');
   }
 }
