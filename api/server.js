@@ -447,6 +447,7 @@ const stageEngine = createStageEngine({
   advanceStageVal,
   onStageAdvanced: async (room) => {
     try {
+      // Nudge only; rough draft is user-triggered
       await addMessage(room.roomId, {
         text: `⏱️ Moving into ${room.stage}. Keep building together and call on me when you’re ready.`,
         phase: room.stage,
@@ -460,12 +461,6 @@ const stageEngine = createStageEngine({
     } catch (e) {
       console.error('[stageEngine onStageAdvanced] error', e);
     }
-  },
-  // 👇 Example: globally cap at FINAL (auto-close after FINAL timer ends)
-  getMaxStageForRoom: (room) => {
-    // You can branch here per site or program later:
-    // if (room.siteId === 'C1') return 'EDITING';
-    return 'FINAL';
   },
 });
 stageEngine.start();
