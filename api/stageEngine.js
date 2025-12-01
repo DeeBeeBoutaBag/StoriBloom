@@ -15,6 +15,7 @@
  * - updateRoom(roomId, patch)
  * - advanceStageVal(currentStage)
  * - onStageAdvanced?(updatedRoom)
+ * - getMaxStageForRoom?(room) -> string stage name (e.g., 'FINAL') at which we should close the room
  */
 
 const TICK_MS = 5_000;            // how often to check
@@ -41,6 +42,7 @@ export function createStageEngine({
   updateRoom,
   advanceStageVal,
   onStageAdvanced,
+  getMaxStageForRoom, // optional: (room) => 'FINAL' | 'EDITING' | ...
 }) {
   // roomId -> lastTouch timestamp
   const hot = new Map();
@@ -100,7 +102,34 @@ export function createStageEngine({
     // If it's not time yet, do nothing
     if (now < endsAtMs) return;
 
-    // Time's up → advance
+    // ---- Per-room max stage handling ----
+    let maxStage = null;
+    if (typeof getMaxStageForRoom === "function") {
+      try {
+        maxStage = getMaxStageForRoom(room) || null;
+      } catch (err) {
+        console.error("[stageEngine] getMaxStageForRoom error for", roomId, err);
+      }
+    }
+
+    // If this room has a maxStage and we're at it, closing logic:
+    if (maxStage && stage === maxStage) {
+      const updated = await updateRoom(roomId, {
+        stage: "CLOSED",
+        stageEndsAt: now, // mark as ended now
+      });
+
+      // Stop tracking once closed
+      hot.delete(roomId);
+
+      if (onStageAdvanced && updated) {
+        // Treat moving into CLOSED as a final "advanced" event
+        await onStageAdvanced(updated);
+      }
+      return;
+    }
+
+    // Time's up → normal advance
     const nextStage = advanceStageVal(stage);
     if (!nextStage || nextStage === stage) return;
 
@@ -112,6 +141,12 @@ export function createStageEngine({
 
     if (onStageAdvanced && updated) {
       await onStageAdvanced(updated);
+    }
+
+    // If we advanced into CLOSED (based on your ROOM_ORDER/advanceStageVal),
+    // drop from hot after notifying.
+    if (updated.stage === "CLOSED") {
+      hot.delete(roomId);
     }
   }
 

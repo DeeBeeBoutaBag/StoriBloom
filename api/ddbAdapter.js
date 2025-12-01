@@ -13,15 +13,26 @@ import {
  * - Provides sensible defaults for local/dev
  */
 const T = {
-  sites: process.env.DDB_TABLE_SITES || process.env.TABLE_SITES || 'storibloom_sites',
-  rooms: process.env.DDB_TABLE_ROOMS || process.env.TABLE_ROOMS || 'storibloom_rooms',
-  codes: process.env.DDB_TABLE_CODES || process.env.TABLE_CODES || 'storibloom_codes',
+  sites:
+    process.env.DDB_TABLE_SITES ||
+    process.env.TABLE_SITES ||
+    'storibloom_sites',
+  rooms:
+    process.env.DDB_TABLE_ROOMS ||
+    process.env.TABLE_ROOMS ||
+    'storibloom_rooms',
+  codes:
+    process.env.DDB_TABLE_CODES ||
+    process.env.TABLE_CODES ||
+    'storibloom_codes',
   messages:
     process.env.DDB_TABLE_MESSAGES ||
     process.env.TABLE_MESSAGES ||
     'storibloom_messages',
   drafts:
-    process.env.DDB_TABLE_DRAFTS || process.env.TABLE_DRAFTS || 'storibloom_drafts',
+    process.env.DDB_TABLE_DRAFTS ||
+    process.env.TABLE_DRAFTS ||
+    'storibloom_drafts',
   submissions:
     process.env.DDB_TABLE_SUBMISSIONS ||
     process.env.TABLE_SUBMISSIONS ||
@@ -41,7 +52,7 @@ const nowMs = () => Date.now();
 function assertTable(name, value) {
   if (!value) {
     throw new Error(
-      `[ddbAdapter] Missing table name for ${name}. Set DDB_TABLE_${name.toUpperCase()} or TABLE_${name.toUpperCase()}.`
+      `[ddbAdapter] Missing table name for ${name}. Set DDB_TABLE_${name.toUpperCase()} or TABLE_${name.toUpperCase()}.`,
     );
   }
 }
@@ -53,17 +64,21 @@ function assertTable(name, value) {
    ========================= */
 export const Codes = {
   /**
-   * consume(code, uid) → { siteId, role } | { error: "not_found" | "used" }
+   * consume(code, uid) → { siteId, role } | { error: "not_found" | "used" | "invalid_*" }
    * Idempotent-ish via conditional update.
    */
   async consume(code, uid) {
     assertTable('codes', T.codes);
-    if (!code || typeof code !== 'string') return { error: 'invalid_code' };
-    if (!uid || typeof uid !== 'string') return { error: 'invalid_uid' };
+    if (!code || typeof code !== 'string') {
+      return { error: 'invalid_code' };
+    }
+    if (!uid || typeof uid !== 'string') {
+      return { error: 'invalid_uid' };
+    }
 
     // 1) Get item
     const { Item } = await ddb.send(
-      new GetCommand({ TableName: T.codes, Key: { code } })
+      new GetCommand({ TableName: T.codes, Key: { code } }),
     );
     if (!Item) return { error: 'not_found' };
     if (Item.consumed) return { error: 'used' };
@@ -84,7 +99,7 @@ export const Codes = {
             ':ca': nowMs(),
             ':u': uid,
           },
-        })
+        }),
       );
     } catch (err) {
       // If condition fails due to race, treat as used
@@ -108,18 +123,27 @@ export const Rooms = {
     assertTable('rooms', T.rooms);
     if (!roomId) return null;
     const { Item } = await ddb.send(
-      new GetCommand({ TableName: T.rooms, Key: { roomId } })
+      new GetCommand({ TableName: T.rooms, Key: { roomId } }),
     );
     return Item || null;
   },
 
+  /**
+   * Shallow merge patch into existing room row and upsert.
+   * Returns the full updated item.
+   */
   async update(roomId, patch) {
     assertTable('rooms', T.rooms);
     if (!roomId || typeof patch !== 'object' || !patch) {
       throw new Error('[Rooms.update] invalid args');
     }
     const existing = await this.get(roomId);
-    const next = { ...(existing || {}), ...patch, roomId, updatedAt: nowMs() };
+    const next = {
+      ...(existing || {}),
+      ...patch,
+      roomId,
+      updatedAt: nowMs(),
+    };
     await ddb.send(new PutCommand({ TableName: T.rooms, Item: next }));
     return next;
   },
@@ -132,9 +156,19 @@ export const Rooms = {
    - byPhase(): Query partition & filter by phase (cheap for small rooms; add GSI for scale)
    ========================= */
 export const Messages = {
-  async add({ roomId, uid, personaIndex, authorType, phase, text }) {
+  /**
+   * add({ roomId, uid, personaIndex, authorType, phase, text, emoji? }) → { createdAt }
+   *
+   * authorType:
+   *   - 'user'   (default for participants)
+   *   - 'asema'  (our AI persona)
+   *   - 'system' (system notices)
+   */
+  async add({ roomId, uid, personaIndex, authorType, phase, text, emoji }) {
     assertTable('messages', T.messages);
-    if (!roomId || !text) throw new Error('[Messages.add] roomId & text required');
+    if (!roomId || !text) {
+      throw new Error('[Messages.add] roomId & text required');
+    }
 
     const createdAt = nowMs();
     await ddb.send(
@@ -144,66 +178,55 @@ export const Messages = {
           roomId,
           createdAt,
           uid: uid || null,
-          personaIndex: personaIndex ?? null,
-          authorType: authorType || 'USER', // USER | AI | SYSTEM
+          personaIndex: typeof personaIndex === 'number' ? personaIndex : 0,
+          // Normalize to the same lower-case convention used elsewhere in the app
+          authorType: (authorType || 'user').toLowerCase(), // 'user' | 'asema' | 'system'
           phase: phase || null,
           text,
+          emoji: emoji || null,
         },
-      })
+      }),
     );
     return { createdAt };
   },
 
+  /**
+   * byPhase(roomId, phase) → messages[]
+   *
+   * Queries all messages for a room and filters by phase.
+   * For very large rooms, consider adding a GSI on (roomId, phase).
+   */
   async byPhase(roomId, phase) {
     assertTable('messages', T.messages);
     if (!roomId || !phase) return [];
 
-    // Query the partition (room) in ascending order, then filter.
-    // For scale, consider a GSI keyed by (roomId, phase) with createdAt as sort key.
     const { Items } = await ddb.send(
       new QueryCommand({
         TableName: T.messages,
         KeyConditionExpression: 'roomId = :r',
-        ExpressionAttributeValues: { ':r': roomId },
+        ExpressionAttributeValues: {
+          ':r': roomId,
+        },
         ScanIndexForward: true,
-        // FilterExpression applies post-query within partition
-        FilterExpression: '#p = :p',
-        ExpressionAttributeNames: { '#p': 'phase' },
-        ExpressionAttributeValuesAdditional: undefined, // keeps type narrowing clear
-      })
+      }),
     );
 
-    // NOTE: lib-dynamodb doesn't support duplicate keys in the same object,
-    // so we merged ':p' into the same ExpressionAttributeValues above:
-    // Re-issue with merged values:
-    if (!Items) {
-      const { Items: Items2 } = await ddb.send(
-        new QueryCommand({
-          TableName: T.messages,
-          KeyConditionExpression: 'roomId = :r',
-          FilterExpression: '#p = :p',
-          ExpressionAttributeNames: { '#p': 'phase' },
-          ExpressionAttributeValues: { ':r': roomId, ':p': phase },
-          ScanIndexForward: true,
-        })
-      );
-      return Items2 || [];
-    }
-
-    // Fallback filter if driver ignored FilterExpression (safety)
-    return (Items || []).filter((x) => (x.phase || '') === phase);
+    return (Items || []).filter((m) => (m.phase || '') === phase);
   },
 };
 
 /* =========================
    Drafts
    - PK: roomId (string), SK: createdAt (number)
+   - add(): create new draft version
    - latest(): Query desc, Limit 1
    ========================= */
 export const Drafts = {
   async add({ roomId, content, version }) {
     assertTable('drafts', T.drafts);
-    if (!roomId || !content) throw new Error('[Drafts.add] roomId & content required');
+    if (!roomId || !content) {
+      throw new Error('[Drafts.add] roomId & content required');
+    }
 
     await ddb.send(
       new PutCommand({
@@ -214,7 +237,7 @@ export const Drafts = {
           content,
           version: version ?? 1,
         },
-      })
+      }),
     );
   },
 
@@ -229,7 +252,7 @@ export const Drafts = {
         ExpressionAttributeValues: { ':r': roomId },
         ScanIndexForward: false, // newest first
         Limit: 1,
-      })
+      }),
     );
     return (Items && Items[0]) || null;
   },
