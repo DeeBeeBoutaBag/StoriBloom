@@ -131,6 +131,11 @@ export default function Room() {
   const [nowTick, setNowTick] = useState(Date.now());
   const [sentWelcome, setSentWelcome] = useState(false);
 
+  // Connection health for polling
+  const [connectionStatus, setConnectionStatus] = useState('ok'); // 'ok' | 'degraded' | 'down'
+  const [consecutiveErrors, setConsecutiveErrors] = useState(0);
+  const pollDelayRef = useRef(1200); // ms
+
   // Voting (frontend glue; backend handles real logic)
   const [voteOpen, setVoteOpen] = useState(false);
   const [voteOptions, setVoteOptions] = useState([]);
@@ -159,60 +164,81 @@ export default function Room() {
     return () => clearInterval(t);
   }, []);
 
-  // --- Poll room state + messages ---
+  // --- Poll room state + messages with backoff + health indicator ---
   useEffect(() => {
-    let mounted = true;
+    let cancelled = false;
+    let timeoutId = null;
 
     async function loadState() {
-      try {
-        const res = await fetch(`${API_BASE}/rooms/${roomId}/state`, await authHeaders());
-        if (!res.ok) return;
-        const j = await res.json();
-        if (!mounted) return;
-        setStage(j.stage || 'LOBBY');
-        setStageEndsAt(j.stageEndsAt ? new Date(j.stageEndsAt) : null);
-        setRoomMeta({
-          siteId: j.siteId || roomId.split('-')[0],
-          index: j.index || 1,
-          inputLocked: !!j.inputLocked,
-          topic: j.topic || '',
-        });
-        setIdeaSummary(j.ideaSummary || '');
-      } catch (e) {
-        if (mounted) console.error('[Room] loadState error', e);
-      }
+      const res = await fetch(`${API_BASE}/rooms/${roomId}/state`, await authHeaders());
+      if (!res.ok) throw new Error('state fetch failed');
+      const j = await res.json();
+      if (cancelled) return;
+
+      setStage(j.stage || 'LOBBY');
+      setStageEndsAt(j.stageEndsAt ? new Date(j.stageEndsAt) : null);
+      setRoomMeta({
+        siteId: j.siteId || roomId.split('-')[0],
+        index: j.index || 1,
+        inputLocked: !!j.inputLocked,
+        topic: j.topic || '',
+      });
+      setIdeaSummary(j.ideaSummary || '');
     }
 
     async function loadMessages() {
+      const res = await fetch(`${API_BASE}/rooms/${roomId}/messages`, await authHeaders());
+      if (!res.ok) throw new Error('messages fetch failed');
+      const j = await res.json();
+      if (cancelled) return;
+
+      const arr = (j.messages || []).map((m, idx) => ({
+        id: String(m.createdAt || idx),
+        ...m,
+      }));
+      setMessages(arr);
+      requestAnimationFrame(() => {
+        const el = scrollRef.current;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    }
+
+    async function pollOnce() {
       try {
-        const res = await fetch(`${API_BASE}/rooms/${roomId}/messages`, await authHeaders());
-        if (!res.ok) return;
-        const j = await res.json();
-        if (!mounted) return;
-        const arr = (j.messages || []).map((m, idx) => ({
-          id: String(m.createdAt || idx),
-          ...m,
-        }));
-        setMessages(arr);
-        requestAnimationFrame(() => {
-          const el = scrollRef.current;
-          if (el) el.scrollTop = el.scrollHeight;
-        });
+        await Promise.all([loadState(), loadMessages()]);
+        if (cancelled) return;
+
+        // success
+        setConsecutiveErrors(0);
+        setConnectionStatus('ok');
+        pollDelayRef.current = 1200;
       } catch (e) {
-        if (mounted) console.error('[Room] loadMessages error', e);
+        if (cancelled) return;
+        console.warn('[Room] poll error', e);
+
+        setConsecutiveErrors((prev) => {
+          const next = prev + 1;
+          if (next >= 1 && next < 4) {
+            setConnectionStatus('degraded');
+          } else if (next >= 4) {
+            setConnectionStatus('down');
+          }
+          return next;
+        });
+
+        // backoff: 1.2s → 2.4s → 4.8s → … up to 10s
+        pollDelayRef.current = Math.min(10000, pollDelayRef.current * 2);
+      } finally {
+        if (cancelled) return;
+        timeoutId = setTimeout(pollOnce, pollDelayRef.current);
       }
     }
 
-    loadState();
-    loadMessages();
-    const id = setInterval(() => {
-      loadState();
-      loadMessages();
-    }, 1500);
+    pollOnce();
 
     return () => {
-      mounted = false;
-      clearInterval(id);
+      cancelled = true;
+      if (timeoutId) clearTimeout(timeoutId);
     };
   }, [roomId]);
 
@@ -443,7 +469,42 @@ export default function Room() {
           stage={stage}
         />
 
-        {/* NEW: compact status strip for facilitators & participants */}
+        {/* Connection health strip */}
+        {connectionStatus !== 'ok' && (
+          <div
+            style={{
+              marginTop: 8,
+              marginBottom: 8,
+              padding: '6px 10px',
+              borderRadius: 999,
+              fontSize: 12,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              background:
+                connectionStatus === 'down'
+                  ? 'rgba(248,113,113,0.18)'
+                  : 'rgba(251,191,36,0.18)',
+              border:
+                connectionStatus === 'down'
+                  ? '1px solid rgba(248,113,113,0.7)'
+                  : '1px solid rgba(251,191,36,0.7)',
+              color: '#fee2e2',
+              maxWidth: '100%',
+            }}
+          >
+            <span style={{ fontSize: 14 }}>
+              {connectionStatus === 'down' ? '⚠️' : '⚡️'}
+            </span>
+            <span style={{ whiteSpace: 'normal' }}>
+              {connectionStatus === 'down'
+                ? 'Disconnected — retrying in the background. Your messages will send once we reconnect.'
+                : 'Network is unstable — reconnecting…'}
+            </span>
+          </div>
+        )}
+
+        {/* Compact status strip for facilitators & participants */}
         <div className="status-strip">
           <span className="status-chip">
             Round <b>{roundIndex}</b> of <b>{roundTotal}</b>
@@ -864,7 +925,7 @@ export default function Room() {
         </div>
       )}
 
-      {/* NEW: Floating Stage Legend pill (bottom-left) */}
+      {/* Floating Stage Legend pill (bottom-left) */}
       <StageLegendPill
         stage={stage}
         open={legendOpen}
