@@ -14,25 +14,27 @@ export default function PresenterHUD({ siteId, rooms }) {
   const room = sorted[i];
 
   const post = useCallback(
-    async (path, body) => {
-      if (!room) return;
-      try {
-        const url = `${API_BASE}${path.replace(':roomId', encodeURIComponent(room.id))}`;
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: await authHeaders(),
-          body: body ? JSON.stringify(body) : undefined,
-        });
-        if (!res.ok) {
-          const j = await res.json().catch(() => ({}));
-          throw new Error(j.error || 'Action failed');
-        }
-      } catch (err) {
-        alert(err.message || 'Action failed');
+  async (path, body) => {
+    if (!room) return;
+    try {
+      const url = `${API_BASE}${path.replace(':roomId', encodeURIComponent(room.id))}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        // IMPORTANT: spread authHeaders, don't put it under `headers:` yourself
+        ...(await authHeaders()),
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.error || 'Action failed');
       }
-    },
-    [room]
-  );
+    } catch (err) {
+      alert(err.message || 'Action failed');
+    }
+  },
+  [room]
+);
+
 
   const next = useCallback(
     () => post(`/rooms/:roomId/next`, {}),
