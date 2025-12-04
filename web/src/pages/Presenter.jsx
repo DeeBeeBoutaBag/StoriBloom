@@ -13,6 +13,7 @@ const STAGES = [
   'ROUGH_DRAFT',
   'EDITING',
   'FINAL',
+  'CLOSED', // include CLOSED in presenter summary
 ];
 
 function useSiteIdFromUrl() {
@@ -167,10 +168,19 @@ export default function Presenter() {
           </div>
 
           <div className="presenter-meta">
-            <div>Hotkeys on Room 1: <b>N</b> Next, <b>+</b> +2m, <b>R</b> Redo</div>
-            <div>Status: <span className="pill pill-live">{canFetch ? 'Live' : 'Idle'}</span></div>
-            <div>Rooms: <b>{rooms.length}</b></div>
-            <div>Participants: <b>{estimatedSeats}</b></div>
+            <div>
+              Hotkeys on Room 1: <b>N</b> Next, <b>+</b> +2m, <b>R</b> Redo
+            </div>
+            <div>
+              Status:{' '}
+              <span className="pill pill-live">{canFetch ? 'Live' : 'Idle'}</span>
+            </div>
+            <div>
+              Rooms: <b>{rooms.length}</b>
+            </div>
+            <div>
+              Participants: <b>{estimatedSeats}</b>
+            </div>
           </div>
         </header>
 
@@ -195,91 +205,132 @@ export default function Presenter() {
         {!error && !loading && canFetch && rooms.length === 0 && (
           <div className="presenter-empty glass">
             No rooms returned for site <b>{siteId}</b>.<br />
-            Check that your codes point to this site ID and that
-            <code> /presenter/rooms?siteId={siteId}</code> is returning rooms.
+            Check that your codes point to this site ID and that{' '}
+            <code>/presenter/rooms?siteId={siteId}</code> is returning rooms.
           </div>
         )}
 
         {/* Rooms grid */}
         <main className="rooms-grid">
-          {sortedRooms.map((r) => (
-            <article key={r.id} className="room-card glass">
-              <header className="room-card-head">
-                <div>
-                  <div className="room-card-title">Room {r.index} {siteId}</div>
-                  <div className="room-card-sub">
-                    {r.stage === 'LOBBY'
-                      ? 'Waiting for participants.'
-                      : 'Stage in progress.'}
+          {sortedRooms.map((r) => {
+            const isClosed = (r.stage || '') === 'CLOSED';
+
+            return (
+              <article key={r.id} className="room-card glass">
+                <header className="room-card-head">
+                  <div>
+                    <div className="room-card-title">
+                      Room {r.index} {siteId}
+                    </div>
+                    <div className="room-card-sub">
+                      {r.stage === 'LOBBY'
+                        ? 'Waiting for participants.'
+                        : isClosed
+                        ? 'Session complete — abstract ready.'
+                        : 'Stage in progress.'}
+                    </div>
                   </div>
-                </div>
 
-                <div className="room-card-stage">
-                  <span className="pill pill-stage">{r.stage || '—'}</span>
-                  <span className="pill pill-status">{r.closed ? 'CLOSED' : 'OPEN'}</span>
-                </div>
-              </header>
+                  <div className="room-card-stage">
+                    <span className="pill pill-stage">{r.stage || '—'}</span>
+                    <span className={`pill pill-status ${isClosed ? 'pill-closed' : ''}`}>
+                      {isClosed ? 'CLOSED' : 'OPEN'}
+                    </span>
+                  </div>
+                </header>
 
-              <section className="room-card-meta">
-                <div><span className="label">Seats</span> {r.seats ?? '—'}</div>
-                <div><span className="label">Locked</span> {r.inputLocked ? 'Yes' : 'No'}</div>
-                <div className="room-card-topic">
-                  <span className="label">Topic</span> {r.topic || '—'}
-                </div>
-              </section>
-
-              {r.vote && (
-                <section className="room-card-vote">
-                  <div><span className="label">Voting</span> {r.vote.open ? 'Open' : 'Closed'}</div>
-                  <div><span className="label">Ballots</span> {r.vote.total ?? 0}</div>
-                  {r.vote.tallies && (
-                    <details>
-                      <summary> Tallies</summary>
-                      <ul>
-                        {Object.entries(r.vote.tallies).map(([k, v]) => (
-                          <li key={k}>#{k}: {v}</li>
-                        ))}
-                      </ul>
-                    </details>
-                  )}
+                <section className="room-card-meta">
+                  <div>
+                    <span className="label">Seats</span> {r.seats ?? '—'}
+                  </div>
+                  <div>
+                    <span className="label">Locked</span> {r.inputLocked ? 'Yes' : 'No'}
+                  </div>
+                  <div className="room-card-topic">
+                    <span className="label">Topic</span> {r.topic || '—'}
+                  </div>
                 </section>
-              )}
 
-              <section className="room-card-controls">
-                <div className="room-card-row">
-                  <button type="button" onClick={() => next(r.id)}>Next</button>
-                  <button type="button" onClick={() => extend(r.id, 120)}>+2m</button>
-                  <button type="button" onClick={() => redo(r.id)}>Redo</button>
-                  <button type="button" onClick={() => lock(r.id)} className="warn">Lock</button>
-                  <button type="button" onClick={() => unlock(r.id)} className="safe">Unlock</button>
-                </div>
+                {r.vote && (
+                  <section className="room-card-vote">
+                    <div>
+                      <span className="label">Voting</span>{' '}
+                      {r.vote.open ? 'Open' : 'Closed'}
+                    </div>
+                    <div>
+                      <span className="label">Ballots</span> {r.vote.total ?? 0}
+                    </div>
+                    {r.vote.tallies && (
+                      <details>
+                        <summary> Tallies</summary>
+                        <ul>
+                          {Object.entries(r.vote.tallies).map(([k, v]) => (
+                            <li key={k}>
+                              #{k}: {v}
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+                  </section>
+                )}
 
-                <div className="room-card-row">
-                  <button type="button" onClick={() => startVote(r.id)}>Start Voting</button>
-                  <button
-                    type="button"
-                    onClick={() => closeVote(r.id)}
-                    className="warn"
-                  >
-                    Close &amp; Lock Topic
-                  </button>
-                  <a
-                    href={`/room/${r.id}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="room-open-link"
-                  >
-                    Open Room View
-                  </a>
-                </div>
-              </section>
+                <section className="room-card-controls">
+                  <div className="room-card-row">
+                    <button type="button" onClick={() => next(r.id)}>
+                      Next
+                    </button>
+                    <button type="button" onClick={() => extend(r.id, 120)}>
+                      +2m
+                    </button>
+                    <button type="button" onClick={() => redo(r.id)}>
+                      Redo
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => lock(r.id)}
+                      className="warn"
+                    >
+                      Lock
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => unlock(r.id)}
+                      className="safe"
+                    >
+                      Unlock
+                    </button>
+                  </div>
 
-              {/* Optional inline presenter voting panel */}
-              <section className="room-card-voting-panel">
-                <PresenterVotingPanel roomId={r.id} isPresenter />
-              </section>
-            </article>
-          ))}
+                  <div className="room-card-row">
+                    <button type="button" onClick={() => startVote(r.id)}>
+                      Start Voting
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => closeVote(r.id)}
+                      className="warn"
+                    >
+                      Close &amp; Lock Topic
+                    </button>
+                    <a
+                      href={`/room/${r.id}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="room-open-link"
+                    >
+                      Open Room View
+                    </a>
+                  </div>
+                </section>
+
+                {/* Optional inline presenter voting panel */}
+                <section className="room-card-voting-panel">
+                  <PresenterVotingPanel roomId={r.id} isPresenter />
+                </section>
+              </article>
+            );
+          })}
         </main>
       </div>
 

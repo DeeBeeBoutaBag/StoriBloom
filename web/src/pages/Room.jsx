@@ -17,7 +17,7 @@ const ORDER = [
   'ROUGH_DRAFT',
   'EDITING',
   'FINAL',
-  'CLOSED', // NEW: closed stage
+  'CLOSED',
 ];
 
 const TOTAL_BY_STAGE = {
@@ -31,7 +31,6 @@ const TOTAL_BY_STAGE = {
   CLOSED: 0,
 };
 
-// Small helper for mm:ss display in status strip
 function formatTime(seconds) {
   const s = Math.max(0, Math.floor(seconds || 0));
   const m = Math.floor(s / 60);
@@ -39,7 +38,6 @@ function formatTime(seconds) {
   return `${m}:${r.toString().padStart(2, '0')}`;
 }
 
-// Quick legend text for each stage
 const STAGE_DESCRIPTIONS = {
   LOBBY: 'Everyone lands, tests chat, and gets oriented.',
   DISCOVERY: 'Share first thoughts and stories about the topic.',
@@ -63,9 +61,7 @@ function StageLegendPill({ stage, open, onToggle }) {
         aria-label="Show stage legend"
       >
         <span className="stage-legend-dot" />
-        <span className="stage-legend-label">
-          {niceStage}
-        </span>
+        <span className="stage-legend-label">{niceStage}</span>
         <span className="stage-legend-help">?</span>
       </button>
 
@@ -118,6 +114,9 @@ export default function Room() {
     index: 1,
     inputLocked: false,
     topic: '',
+    seats: 0,
+    finalReadyCount: 0,
+    finalCompletedAt: null,
   });
 
   // Messages + ideas
@@ -162,6 +161,12 @@ export default function Room() {
   // Legend toggle
   const [legendOpen, setLegendOpen] = useState(false);
 
+  // Planning stage local state (interactive panel)
+  const [planningFocus, setPlanningFocus] = useState('');
+  const [planningStructure, setPlanningStructure] = useState('');
+  const [planningKeyPoints, setPlanningKeyPoints] = useState('');
+  const [planningBusy, setPlanningBusy] = useState(false);
+
   // --- Auth bootstrap ---
   useEffect(() => {
     ensureGuest().catch((e) => {
@@ -192,6 +197,9 @@ export default function Room() {
           index: j.index || 1,
           inputLocked: !!j.inputLocked,
           topic: j.topic || '',
+          seats: j.seats || 0,
+          finalReadyCount: Number(j.finalReadyCount || 0),
+          finalCompletedAt: j.finalCompletedAt || null,
         });
         setIdeaSummary(j.ideaSummary || '');
       } catch (e) {
@@ -380,6 +388,54 @@ export default function Room() {
     }
   }
 
+  // --- Planning: share outline as a single chat message ---
+  async function sharePlanningOutline() {
+    if (planningBusy) return;
+    const focus = planningFocus.trim();
+    const structure = planningStructure.trim();
+    const keyPointsRaw = planningKeyPoints.trim();
+
+    if (!focus && !structure && !keyPointsRaw) return;
+
+    setPlanningBusy(true);
+    try {
+      const bullets = keyPointsRaw
+        ? keyPointsRaw
+            .split('\n')
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .map((s) => `- ${s}`)
+            .join('\n')
+        : '';
+
+      const text = [
+        '🧩 **Planning Outline**',
+        focus ? `**1️⃣ Focus / angle:** ${focus}` : '',
+        structure ? `**2️⃣ Structure:** ${structure}` : '',
+        bullets ? `**3️⃣ Key beats:**\n${bullets}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+
+      await fetch(`${API_BASE}/rooms/${roomId}/messages`, {
+        method: 'POST',
+        ...(await authHeaders()),
+        body: JSON.stringify({
+          text,
+          phase: 'PLANNING',
+          personaIndex: activePersona,
+          emoji: personas[activePersona] || personas[0],
+        }),
+      });
+
+      // keep the fields, or lightly mark that it was shared (no hard reset so they can tweak)
+    } catch (e) {
+      console.error('[Room] sharePlanningOutline error', e);
+    } finally {
+      setPlanningBusy(false);
+    }
+  }
+
   // --- Send message (user) ---
   async function send() {
     const t = text.trim();
@@ -453,7 +509,7 @@ export default function Room() {
       }
     }
 
-    // 4) In FINAL: "done" / "submit" marks ready (backend should implement /final/ready)
+    // 4) In FINAL: "done" / "submit" marks ready (this drives the ready meter)
     if (stage === 'FINAL' && /^(done|submit)\b/i.test(t)) {
       try {
         await fetch(`${API_BASE}/rooms/${roomId}/final/ready`, {
@@ -501,6 +557,11 @@ export default function Room() {
 
   // When CLOSED, show FINAL-phase transcript (closing message + abstract)
   const effectivePhase = stage === 'CLOSED' ? 'FINAL' : stage;
+
+  // FINAL stage ready meter
+  const readyCount = roomMeta.finalReadyCount || 0;
+  const totalSeats = roomMeta.seats || 0;
+  const readyPct = totalSeats ? Math.round((readyCount / totalSeats) * 100) : 0;
 
   return (
     <>
@@ -707,11 +768,128 @@ export default function Room() {
             </div>
           </div>
 
-          {/* Idea Sidebar (Discovery / Idea Dump / Planning) */}
-          {(stage === 'DISCOVERY' ||
-            stage === 'IDEA_DUMP' ||
-            stage === 'PLANNING') && (
+          {/* Sidebar:
+              - Discovery / Idea Dump: idea summary
+              - Planning: interactive planning panel
+          */}
+          {(stage === 'DISCOVERY' || stage === 'IDEA_DUMP') && (
             <IdeaSidebar summary={ideaSummary} />
+          )}
+
+          {stage === 'PLANNING' && (
+            <div
+              className="planning-panel"
+              style={{
+                borderRadius: 16,
+                padding: 12,
+                background: 'rgba(15,23,42,0.9)',
+                border: '1px solid rgba(148,163,184,0.35)',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 10,
+                fontSize: 13,
+              }}
+            >
+              <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>
+                🧩 Planning Board
+              </div>
+              <div style={{ opacity: 0.8, fontSize: 12, marginBottom: 6 }}>
+                Use this like a mini outline. When it feels good, click
+                <b> “Share plan with room”</b> so everyone sees the shape before Asema drafts.
+              </div>
+
+              {ideaSummary && (
+                <div
+                  style={{
+                    padding: 8,
+                    borderRadius: 10,
+                    background: 'rgba(30,64,175,0.25)',
+                    border: '1px solid rgba(129,140,248,0.6)',
+                    maxHeight: 120,
+                    overflowY: 'auto',
+                    fontSize: 12,
+                  }}
+                >
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>Idea Highlights</div>
+                  <div style={{ whiteSpace: 'pre-wrap' }}>{ideaSummary}</div>
+                </div>
+              )}
+
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <span style={{ fontWeight: 600 }}>1️⃣ Focus / angle</span>
+                <input
+                  type="text"
+                  value={planningFocus}
+                  onChange={(e) => setPlanningFocus(e.target.value)}
+                  placeholder="ex: A teen stopped and profiled on his way to practice…"
+                  style={{
+                    borderRadius: 8,
+                    border: '1px solid rgba(148,163,184,0.6)',
+                    padding: '6px 8px',
+                    background: 'rgba(15,23,42,0.9)',
+                    color: 'white',
+                    fontSize: 12,
+                  }}
+                />
+              </label>
+
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <span style={{ fontWeight: 600 }}>2️⃣ Structure</span>
+                <input
+                  type="text"
+                  value={planningStructure}
+                  onChange={(e) => setPlanningStructure(e.target.value)}
+                  placeholder="ex: 3-part story (setup → turning point → what changes)"
+                  style={{
+                    borderRadius: 8,
+                    border: '1px solid rgba(148,163,184,0.6)',
+                    padding: '6px 8px',
+                    background: 'rgba(15,23,42,0.9)',
+                    color: 'white',
+                    fontSize: 12,
+                  }}
+                />
+              </label>
+
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <span style={{ fontWeight: 600 }}>3️⃣ Key beats (one per line)</span>
+                <textarea
+                  value={planningKeyPoints}
+                  onChange={(e) => setPlanningKeyPoints(e.target.value)}
+                  placeholder={`ex:\nHe gets stopped and searched in front of neighbors\nCoach shows up and confronts officers\nHe decides how to respond and what community action to take`}
+                  rows={4}
+                  style={{
+                    borderRadius: 8,
+                    border: '1px solid rgba(148,163,184,0.6)',
+                    padding: '6px 8px',
+                    background: 'rgba(15,23,42,0.9)',
+                    color: 'white',
+                    fontSize: 12,
+                    resize: 'vertical',
+                  }}
+                />
+              </label>
+
+              <button
+                className="btn primary"
+                style={{ marginTop: 4, width: '100%' }}
+                onClick={sharePlanningOutline}
+                disabled={planningBusy || (!planningFocus.trim() && !planningStructure.trim() && !planningKeyPoints.trim())}
+              >
+                {planningBusy ? 'Sharing plan…' : 'Share plan with room'}
+              </button>
+
+              <div
+                style={{
+                  opacity: 0.7,
+                  fontSize: 11,
+                  marginTop: 4,
+                }}
+              >
+                Tip: After sharing, ask Asema in chat, “Use our Planning Outline for the rough
+                draft” when you move to the next stage.
+              </div>
+            </div>
           )}
         </div>
 
@@ -762,6 +940,16 @@ export default function Room() {
             </>
           )}
 
+          {stage === 'PLANNING' && (
+            <div
+              className="hud-pill"
+              style={{ display: 'flex', gap: 8, alignItems: 'center' }}
+            >
+              🧩 Use the Planning Board on the right to lock a focus, structure, and 3 key beats.
+              Once you share the plan, use it as the blueprint for the rough draft.
+            </div>
+          )}
+
           {stage === 'ROUGH_DRAFT' && (
             <button
               className="btn"
@@ -777,15 +965,55 @@ export default function Room() {
           )}
 
           {stage === 'FINAL' && (
-            <button
-              className="btn primary"
-              onClick={finalize}
-              disabled={finalBusy}
-            >
-              {finalBusy
-                ? 'Finalizing Session…'
-                : 'Finalize Session'}
-            </button>
+            <>
+              {/* Ready meter */}
+              <div
+                className="hud-pill"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                }}
+              >
+                <span>
+                  ✅ Ready: <b>{readyCount}</b> / <b>{totalSeats || '—'}</b>
+                </span>
+                <div
+                  style={{
+                    flex: 1,
+                    height: 6,
+                    borderRadius: 999,
+                    background: 'rgba(51,65,85,0.9)',
+                    overflow: 'hidden',
+                    minWidth: 80,
+                  }}
+                >
+                  <div
+                    style={{
+                      width: `${Math.min(100, readyPct)}%`,
+                      height: '100%',
+                      background:
+                        'linear-gradient(to right, #22c55e, #a3e635)',
+                      transition: 'width 0.25s ease-out',
+                    }}
+                  />
+                </div>
+                <span style={{ fontSize: 11, opacity: 0.8 }}>
+                  Type “done” or “submit” to bump the meter.
+                </span>
+              </div>
+
+              <button
+                className="btn primary"
+                onClick={finalize}
+                disabled={finalBusy}
+                style={{ marginLeft: 'auto' }}
+              >
+                {finalBusy
+                  ? 'Finalizing Session…'
+                  : 'Finalize Session'}
+              </button>
+            </>
           )}
 
           {stage === 'CLOSED' && (
