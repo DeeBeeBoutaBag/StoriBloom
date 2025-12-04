@@ -158,14 +158,15 @@ const ROOM_ORDER = [
   'CLOSED',
 ];
 
+// Align durations more closely with UI (Room.jsx TOTAL_BY_STAGE)
 const STAGE_DURATIONS = {
-  LOBBY: 10 * 60_000,
-  DISCOVERY: 6 * 60_000,
-  IDEA_DUMP: 6 * 60_000,
-  PLANNING: 6 * 60_000,
-  ROUGH_DRAFT: 6 * 60_000,
-  EDITING: 6 * 60_000,
-  FINAL: 6 * 60_000,
+  LOBBY: 10 * 60_000,       // 10 min
+  DISCOVERY: 10 * 60_000,   // 10 min
+  IDEA_DUMP: 3 * 60_000,    // 3 min
+  PLANNING: 10 * 60_000,    // 10 min
+  ROUGH_DRAFT: 4 * 60_000,  // 4 min
+  EDITING: 10 * 60_000,     // 10 min
+  FINAL: 6 * 60_000,        // 6 min
 };
 function getStageDuration(stage) {
   return STAGE_DURATIONS[stage] || 6 * 60_000;
@@ -212,6 +213,12 @@ async function ensureRoom(roomId) {
     voteTallies: {},
     greetedForStage: {},
     seats: [], // track occupancy
+
+    // NEW: final-stage tracking
+    finalReadyUids: [],
+    finalReadyCount: 0,
+    finalCompletedAt: null,
+
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
@@ -447,28 +454,63 @@ const stageEngine = createStageEngine({
   advanceStageVal,
   onStageAdvanced: async (room) => {
     try {
+      const stage = room.stage || 'LOBBY';
+
+      // 1) Always drop a short nudge from Asema on stage change
       await addMessage(room.roomId, {
-        text: `⏱️ Moving into ${room.stage}. Keep building together and call on me when you’re ready.`,
-        phase: room.stage,
+        text: `⏱️ Moving into **${stage}**. Keep building together and call on me when you’re ready.`,
+        phase: stage,
         authorType: 'asema',
         personaIndex: 0,
       });
 
+      // 2) Special handling for EDITING:
+      //    - Re-post the latest rough draft into this stage so people can edit it in context.
+      if (stage === 'EDITING') {
+        try {
+          const latestDraft = await getLatestDraft(room.roomId);
+          if (latestDraft && latestDraft.content) {
+            // Small intro line so they know what it is
+            await addMessage(room.roomId, {
+              text: '✂️ Here’s your rough draft again — copy lines, rewrite them, and ask me for tighter versions.',
+              phase: 'EDITING',
+              authorType: 'asema',
+              personaIndex: 0,
+            });
+
+            // The actual draft text as the main editing reference
+            await addMessage(room.roomId, {
+              text: latestDraft.content,
+              phase: 'EDITING',
+              authorType: 'asema',
+              personaIndex: 0,
+            });
+          } else {
+            // No saved draft (edge case)
+            await addMessage(room.roomId, {
+              text: 'I don’t see a rough draft saved yet — generate one in the ROUGH_DRAFT stage first, then we’ll polish it here.',
+              phase: 'EDITING',
+              authorType: 'asema',
+              personaIndex: 0,
+            });
+          }
+        } catch (err) {
+          console.error('[stageEngine EDITING] failed to load draft', err);
+        }
+      }
+
+      // 3) Reset greetedForStage so the /welcome endpoint
+      //    can give a fresh, stage-specific greeting if called.
       const greeted = { ...(room.greetedForStage || {}) };
-      greeted[room.stage] = false;
+      greeted[stage] = false;
       await updateRoom(room.roomId, { greetedForStage: greeted });
     } catch (e) {
       console.error('[stageEngine onStageAdvanced] error', e);
     }
   },
-  // 👇 Example: globally cap at FINAL (auto-close after FINAL timer ends)
-  getMaxStageForRoom: (room) => {
-    // You can branch here per site or program later:
-    // if (room.siteId === 'C1') return 'EDITING';
-    return 'FINAL';
-  },
 });
 stageEngine.start();
+
 
 // ---------- Health ----------
 app.get('/health', (_req, res) =>
@@ -519,7 +561,6 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
   let r = await ensureRoom(roomId);
   const now = Date.now();
 
-  // Normalize stageEndsAt -> ms
   const toMs = (val) => {
     if (!val) return 0;
     if (typeof val === 'number') return val;
@@ -530,7 +571,6 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
   let stage = r.stage || 'LOBBY';
   let endsAtMs = toMs(r.stageEndsAt);
 
-  // Only set missing LOBBY timer once (do not loop-reset)
   if (stage === 'LOBBY' && !endsAtMs) {
     endsAtMs = now + getStageDuration('LOBBY');
     r = await updateRoom(roomId, {
@@ -551,8 +591,14 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
     inputLocked: !!r.inputLocked,
     topic: r.topic || '',
     ideaSummary: r.ideaSummary || '',
+
+    // NEW
+    seats: Array.isArray(r.seats) ? r.seats.length : 0,
+    finalReadyCount: Number(r.finalReadyCount || 0),
+    finalCompletedAt: r.finalCompletedAt || null,
   });
 });
+
 
 app.post('/rooms/:roomId/messages', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
@@ -894,9 +940,121 @@ app.post('/rooms/:roomId/draft/generate', requireAuth, async (req, res) => {
 app.post('/rooms/:roomId/final/start', requireAuth, async (_req, res) =>
   res.json({ ok: true })
 );
-app.post('/rooms/:roomId/final/complete', requireAuth, async (_req, res) =>
-  res.json({ ok: true })
-);
+app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
+  const roomId = req.params.roomId;
+
+  try {
+    const room = await ensureRoom(roomId);
+    const stage = room.stage || 'LOBBY';
+    if (stage !== 'FINAL') {
+      return res
+        .status(400)
+        .json({ error: 'wrong_stage', stage });
+    }
+
+    // How many people clicked "done" vs total seats
+    const readyCount = Number(room.finalReadyCount || 0);
+    const seats = Array.isArray(room.seats) ? room.seats.length : 0;
+
+    // 1) Try to get the latest rough draft as base text
+    const latestDraft = await getLatestDraft(roomId);
+    const baseDraft = latestDraft && latestDraft.content ? latestDraft.content.trim() : '';
+
+    // 2) Drop a closing ceremony message from Asema
+    const closingLines = [];
+    closingLines.push('🏁 **Session complete.** Beautiful work, team.');
+    if (seats > 0) {
+      closingLines.push(
+        `**${readyCount} / ${seats}** teammates clicked **done** — that’s your consensus on this abstract.`
+      );
+    }
+    if (room.topic) {
+      closingLines.push(`We just wrapped a story on **${room.topic}**.`);
+    }
+    closingLines.push(
+      'You can screenshot or copy your final abstract below, and keep this as a seed for a full piece or performance.'
+    );
+
+    await addMessage(roomId, {
+      text: closingLines.join(' '),
+      phase: 'FINAL',
+      authorType: 'asema',
+      personaIndex: 0,
+    });
+
+    // 3) Re-post the final abstract clearly labeled
+    if (baseDraft) {
+      await addMessage(roomId, {
+        text: `**Final Abstract**\n\n${baseDraft}`,
+        phase: 'FINAL',
+        authorType: 'asema',
+        personaIndex: 0,
+      });
+    } else {
+      await addMessage(roomId, {
+        text: 'I don’t see a saved rough draft — your chat log is still full of good material. Copy what you like and keep building it offline.',
+        phase: 'FINAL',
+        authorType: 'asema',
+        personaIndex: 0,
+      });
+    }
+
+    // 4) Lock and close the room
+    const finalCompletedAt = Date.now();
+    const updated = await updateRoom(roomId, {
+      stage: 'CLOSED',
+      inputLocked: true,
+      finalCompletedAt,
+    });
+
+    return res.json({
+      ok: true,
+      closed: true,
+      stage: updated.stage,
+      finalCompletedAt,
+      readyCount,
+      seats,
+    });
+  } catch (e) {
+    console.error('[final/complete] error', e);
+    return res.status(500).json({ error: 'final_complete_failed' });
+  }
+});
+
+
+// Mark a participant as "ready" in FINAL stage (called when they type "done"/"submit")
+app.post('/rooms/:roomId/final/ready', requireAuth, async (req, res) => {
+  const roomId = req.params.roomId;
+  const uid = req.user?.uid;
+  if (!uid) {
+    return res.status(401).json({ error: 'no_uid' });
+  }
+
+  const r = await ensureRoom(roomId);
+  const stage = r.stage || 'LOBBY';
+  if (stage !== 'FINAL') {
+    return res.status(400).json({ error: 'wrong_stage', stage });
+  }
+
+  let readyUids = Array.isArray(r.finalReadyUids) ? r.finalReadyUids.slice() : [];
+  if (!readyUids.includes(uid)) {
+    readyUids.push(uid);
+  }
+
+  const updated = await updateRoom(roomId, {
+    finalReadyUids: readyUids,
+    finalReadyCount: readyUids.length,
+  });
+
+  const seats = Array.isArray(updated.seats) ? updated.seats.length : 0;
+
+  return res.json({
+    ok: true,
+    readyCount: updated.finalReadyCount || 0,
+    seats,
+  });
+});
+
 
 // ---------- Codes: consume ----------
 app.post('/codes/consume', requireAuth, async (req, res) => {

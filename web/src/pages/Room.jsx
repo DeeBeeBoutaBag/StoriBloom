@@ -91,6 +91,137 @@ function StageLegendPill({ stage, open, onToggle }) {
   );
 }
 
+// --- Planning Sidebar: dynamic story blueprint for PLANNING stage ---
+function PlanningSidebar({ stage, outline, suggestions, onChoose }) {
+  if (stage !== 'PLANNING') return null;
+
+  const fields = [
+    { key: 'protagonist', label: 'Protagonist', hint: 'Who is the main character?' },
+    { key: 'goal', label: 'Goal', hint: 'What do they want most?' },
+    { key: 'obstacle', label: 'Obstacle', hint: 'What stands in their way?' },
+    { key: 'setting', label: 'Setting', hint: 'Where does this unfold?' },
+    { key: 'tone', label: 'Tone', hint: 'What is the emotional vibe?' },
+  ];
+
+  const complete = fields.filter((f) => outline[f.key]).length;
+
+  return (
+    <div
+      style={{
+        minWidth: 280,
+        maxWidth: 320,
+        alignSelf: 'stretch',
+        backdropFilter: 'blur(12px)',
+        background: 'rgba(255,255,255,0.05)',
+        border: '1px solid rgba(255,255,255,0.12)',
+        borderRadius: 14,
+        padding: 14,
+        color: '#e5e7eb',
+        fontFamily: 'system-ui, sans-serif',
+        overflowY: 'auto',
+      }}
+    >
+      <div
+        style={{
+          fontWeight: 700,
+          fontSize: 15,
+          color: '#f0c86b',
+          marginBottom: 6,
+          letterSpacing: 0.3,
+        }}
+      >
+        🧭 Story Blueprint ({complete}/5)
+      </div>
+      <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 10 }}>
+        Lock in one clear choice for each piece. Click a suggestion or type your own in chat
+        (start with “Protagonist: …”, “Goal: …”, etc.).
+      </div>
+
+      {fields.map((f) => {
+        const value = outline[f.key];
+        const fieldSuggestions = (suggestions || []).slice(0, 4);
+        return (
+          <div key={f.key} style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 13, opacity: 0.9 }}>{f.label}</div>
+
+            {value ? (
+              <div
+                style={{
+                  marginTop: 4,
+                  padding: '6px 10px',
+                  borderRadius: 12,
+                  background: 'rgba(240,200,107,0.14)',
+                  border: '1px solid rgba(240,200,107,0.35)',
+                  fontSize: 13,
+                }}
+              >
+                {value}
+              </div>
+            ) : (
+              <>
+                <div
+                  style={{
+                    fontSize: 11,
+                    opacity: 0.7,
+                    marginTop: 2,
+                    marginBottom: 4,
+                  }}
+                >
+                  {f.hint}
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {fieldSuggestions.length ? (
+                    fieldSuggestions.map((s, idx) => (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => onChoose(f.key, s)}
+                        style={{
+                          borderRadius: 999,
+                          padding: '4px 8px',
+                          border: '1px solid rgba(255,255,255,0.18)',
+                          background: 'rgba(255,255,255,0.06)',
+                          fontSize: 11,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {s}
+                      </button>
+                    ))
+                  ) : (
+                    <span style={{ fontSize: 11, opacity: 0.6 }}>
+                      Waiting on ideas — add more in chat first.
+                    </span>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        );
+      })}
+
+      {complete === 5 && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 10,
+            borderRadius: 10,
+            background: 'rgba(16,185,129,0.20)',
+            border: '1px solid rgba(16,185,129,0.45)',
+            fontSize: 12,
+          }}
+        >
+          🎉 Your blueprint is locked in. When you’re ready, ask
+          {' '}
+          <b>Asema</b>
+          {' '}
+          for the rough draft or hit “Generate Rough Draft”.
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Room() {
   const { roomId } = useParams();
 
@@ -112,6 +243,15 @@ export default function Room() {
   const [messages, setMessages] = useState([]);
   const [ideaSummary, setIdeaSummary] = useState('');
 
+  // Planning outline (client-side shared blueprint feel)
+  const [outline, setOutline] = useState({
+    protagonist: null,
+    goal: null,
+    obstacle: null,
+    setting: null,
+    tone: null,
+  });
+
   // Compose
   const [text, setText] = useState('');
   const [activePersona, setActivePersona] = useState(0);
@@ -131,11 +271,6 @@ export default function Room() {
   const [nowTick, setNowTick] = useState(Date.now());
   const [sentWelcome, setSentWelcome] = useState(false);
 
-  // Connection health for polling
-  const [connectionStatus, setConnectionStatus] = useState('ok'); // 'ok' | 'degraded' | 'down'
-  const [consecutiveErrors, setConsecutiveErrors] = useState(0);
-  const pollDelayRef = useRef(1200); // ms
-
   // Voting (frontend glue; backend handles real logic)
   const [voteOpen, setVoteOpen] = useState(false);
   const [voteOptions, setVoteOptions] = useState([]);
@@ -145,11 +280,22 @@ export default function Room() {
   const [voteTopic, setVoteTopic] = useState('');
   const votePollRef = useRef(null);
 
-  // Rough draft local flag: if we already generated one, next click triggers regen
+  // Rough draft local flags
   const [hasDraft, setHasDraft] = useState(false);
+  const [draftBusy, setDraftBusy] = useState(false); // lock while generating
 
   // Legend toggle
   const [legendOpen, setLegendOpen] = useState(false);
+
+  // Suggestions for planning (derived from Idea Board text)
+  const planningSuggestions = useMemo(() => {
+    if (!ideaSummary) return [];
+    return ideaSummary
+      .split('\n')
+      .map((line) => line.trim().replace(/^[-•]\s*/, ''))
+      .filter(Boolean)
+      .slice(0, 12);
+  }, [ideaSummary]);
 
   // --- Auth bootstrap ---
   useEffect(() => {
@@ -164,81 +310,60 @@ export default function Room() {
     return () => clearInterval(t);
   }, []);
 
-  // --- Poll room state + messages with backoff + health indicator ---
+  // --- Poll room state + messages ---
   useEffect(() => {
-    let cancelled = false;
-    let timeoutId = null;
+    let mounted = true;
 
     async function loadState() {
-      const res = await fetch(`${API_BASE}/rooms/${roomId}/state`, await authHeaders());
-      if (!res.ok) throw new Error('state fetch failed');
-      const j = await res.json();
-      if (cancelled) return;
-
-      setStage(j.stage || 'LOBBY');
-      setStageEndsAt(j.stageEndsAt ? new Date(j.stageEndsAt) : null);
-      setRoomMeta({
-        siteId: j.siteId || roomId.split('-')[0],
-        index: j.index || 1,
-        inputLocked: !!j.inputLocked,
-        topic: j.topic || '',
-      });
-      setIdeaSummary(j.ideaSummary || '');
-    }
-
-    async function loadMessages() {
-      const res = await fetch(`${API_BASE}/rooms/${roomId}/messages`, await authHeaders());
-      if (!res.ok) throw new Error('messages fetch failed');
-      const j = await res.json();
-      if (cancelled) return;
-
-      const arr = (j.messages || []).map((m, idx) => ({
-        id: String(m.createdAt || idx),
-        ...m,
-      }));
-      setMessages(arr);
-      requestAnimationFrame(() => {
-        const el = scrollRef.current;
-        if (el) el.scrollTop = el.scrollHeight;
-      });
-    }
-
-    async function pollOnce() {
       try {
-        await Promise.all([loadState(), loadMessages()]);
-        if (cancelled) return;
-
-        // success
-        setConsecutiveErrors(0);
-        setConnectionStatus('ok');
-        pollDelayRef.current = 1200;
-      } catch (e) {
-        if (cancelled) return;
-        console.warn('[Room] poll error', e);
-
-        setConsecutiveErrors((prev) => {
-          const next = prev + 1;
-          if (next >= 1 && next < 4) {
-            setConnectionStatus('degraded');
-          } else if (next >= 4) {
-            setConnectionStatus('down');
-          }
-          return next;
+        const res = await fetch(`${API_BASE}/rooms/${roomId}/state`, await authHeaders());
+        if (!res.ok) return;
+        const j = await res.json();
+        if (!mounted) return;
+        setStage(j.stage || 'LOBBY');
+        setStageEndsAt(j.stageEndsAt ? new Date(j.stageEndsAt) : null);
+        setRoomMeta({
+          siteId: j.siteId || roomId.split('-')[0],
+          index: j.index || 1,
+          inputLocked: !!j.inputLocked,
+          topic: j.topic || '',
         });
-
-        // backoff: 1.2s → 2.4s → 4.8s → … up to 10s
-        pollDelayRef.current = Math.min(10000, pollDelayRef.current * 2);
-      } finally {
-        if (cancelled) return;
-        timeoutId = setTimeout(pollOnce, pollDelayRef.current);
+        setIdeaSummary(j.ideaSummary || '');
+      } catch (e) {
+        if (mounted) console.error('[Room] loadState error', e);
       }
     }
 
-    pollOnce();
+    async function loadMessages() {
+      try {
+        const res = await fetch(`${API_BASE}/rooms/${roomId}/messages`, await authHeaders());
+        if (!res.ok) return;
+        const j = await res.json();
+        if (!mounted) return;
+        const arr = (j.messages || []).map((m, idx) => ({
+          id: String(m.createdAt || idx),
+          ...m,
+        }));
+        setMessages(arr);
+        requestAnimationFrame(() => {
+          const el = scrollRef.current;
+          if (el) el.scrollTop = el.scrollHeight;
+        });
+      } catch (e) {
+        if (mounted) console.error('[Room] loadMessages error', e);
+      }
+    }
+
+    loadState();
+    loadMessages();
+    const id = setInterval(() => {
+      loadState();
+      loadMessages();
+    }, 1500);
 
     return () => {
-      cancelled = true;
-      if (timeoutId) clearTimeout(timeoutId);
+      mounted = false;
+      clearInterval(id);
     };
   }, [roomId]);
 
@@ -341,74 +466,13 @@ export default function Room() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stage, roomId]);
 
-  // --- Send message (user) ---
-  async function send() {
-    const t = text.trim();
-    if (!t) return;
-
-    // Respect input lock except FINAL and ROUGH_DRAFT (kept open for collab)
-    if (roomMeta.inputLocked && stage !== 'FINAL' && stage !== 'ROUGH_DRAFT') return;
-
-    const emoji = personas[activePersona] || personas[0];
-
-    try {
-      await fetch(`${API_BASE}/rooms/${roomId}/messages`, {
-        method: 'POST',
-        ...(await authHeaders()),
-        body: JSON.stringify({
-          text: t,
-          phase: stage,
-          personaIndex: activePersona,
-          emoji, // include chosen emoji so others see correct identity
-        }),
-      });
-    } catch (e) {
-      console.error('[Room] send error', e);
-    }
-    setText('');
-
-    // If user calls Asema by name → backend /ask
-    if (/(^|\s)asema[\s,!?]/i.test(t) || /^asema\b/i.test(t)) {
-      try {
-        await fetch(`${API_BASE}/rooms/${roomId}/ask`, {
-          method: 'POST',
-          ...(await authHeaders()),
-          body: JSON.stringify({ text: t }),
-        });
-      } catch (e) {
-        console.error('[Room] ask error', e);
-      }
-    }
-
-    // Idea summary trigger (server throttles)
-    if (stage === 'DISCOVERY' || stage === 'IDEA_DUMP' || stage === 'PLANNING') {
-      try {
-        await fetch(`${API_BASE}/rooms/${roomId}/ideas/trigger`, {
-          method: 'POST',
-          ...(await authHeaders()),
-        });
-      } catch (e) {
-        console.warn('[Room] ideas/trigger error', e);
-      }
-    }
-
-    // In FINAL: "done" / "submit" marks ready
-    if (stage === 'FINAL' && /^(done|submit)\b/i.test(t)) {
-      try {
-        await fetch(`${API_BASE}/rooms/${roomId}/final/ready`, {
-          method: 'POST',
-          ...(await authHeaders()),
-        });
-      } catch (e) {
-        console.warn('[Room] final/ready error', e);
-      }
-    }
-  }
-
   // --- Rough Draft: Generate / Regenerate via backend ---
-  async function generateRough() {
+  async function generateRough(requestMode) {
+    if (draftBusy) return;
+    setDraftBusy(true);
     try {
-      const mode = hasDraft ? 'regen' : undefined;
+      const mode = requestMode || (hasDraft ? 'regen' : undefined);
+
       const opts = {
         method: 'POST',
         ...(await authHeaders()),
@@ -416,15 +480,21 @@ export default function Room() {
       if (mode) {
         opts.body = JSON.stringify({ mode });
       }
+
       const res = await fetch(`${API_BASE}/rooms/${roomId}/draft/generate`, opts);
       if (!res.ok) {
-        console.error('[Room] draft/generate failed', await res.text().catch(() => ''));
+        console.error(
+          '[Room] draft/generate failed',
+          await res.text().catch(() => '')
+        );
         return;
       }
       setHasDraft(true);
       // Messages poll loop will pick up Asema's draft message automatically
     } catch (e) {
       console.error('[Room] generateRough error', e);
+    } finally {
+      setDraftBusy(false);
     }
   }
 
@@ -440,6 +510,145 @@ export default function Room() {
     }
   }
 
+  // --- Planning outline choice handler ---
+  async function handleOutlineChoice(fieldKey, value) {
+    setOutline((prev) => ({
+      ...prev,
+      [fieldKey]: value,
+    }));
+
+    const labelMap = {
+      protagonist: 'protagonist',
+      goal: 'goal',
+      obstacle: 'obstacle',
+      setting: 'setting',
+      tone: 'tone',
+    };
+    const label = labelMap[fieldKey] || fieldKey;
+    const text = `Asema, for our ${label}, let’s lock in: ${value}`;
+
+    const emoji = personas[activePersona] || personas[0];
+
+    try {
+      // Announce choice as a user message in PLANNING
+      await fetch(`${API_BASE}/rooms/${roomId}/messages`, {
+        method: 'POST',
+        ...(await authHeaders()),
+        body: JSON.stringify({
+          text,
+          phase: 'PLANNING',
+          personaIndex: activePersona,
+          emoji,
+        }),
+      });
+    } catch (e) {
+      console.error('[Room] outline choice message error', e);
+    }
+
+    try {
+      // Ask Asema to react / keep momentum
+      await fetch(`${API_BASE}/rooms/${roomId}/ask`, {
+        method: 'POST',
+        ...(await authHeaders()),
+        body: JSON.stringify({ text }),
+      });
+    } catch (e) {
+      console.error('[Room] outline choice ask error', e);
+    }
+
+    // Nudge idea summarizer so rough draft sees these locked choices
+    try {
+      await fetch(`${API_BASE}/rooms/${roomId}/ideas/trigger`, {
+        method: 'POST',
+        ...(await authHeaders()),
+      });
+    } catch (e) {
+      console.warn('[Room] outline ideas/trigger error', e);
+    }
+  }
+
+  // --- Send message (user) ---
+  async function send() {
+    const t = text.trim();
+    if (!t) return;
+
+    // If draft is generating in ROUGH_DRAFT, block sends to avoid chaos
+    if (stage === 'ROUGH_DRAFT' && draftBusy) return;
+
+    // Respect input lock except FINAL and ROUGH_DRAFT (kept open for collab)
+    if (roomMeta.inputLocked && stage !== 'FINAL' && stage !== 'ROUGH_DRAFT') return;
+
+    const emoji = personas[activePersona] || personas[0];
+
+    // Detect "Asema, generate rough draft" style commands
+    const lower = t.toLowerCase();
+    const addressedAsema =
+      /(^|\s)asema[\s,!?]/i.test(t) || /^asema\b/i.test(t);
+    const wantsRoughDraft =
+      /rough\s+draft/i.test(lower) ||
+      /(generate|write|make|create|spin up).*(draft|abstract)/i.test(lower);
+
+    try {
+      // 1) Save the user's message
+      await fetch(`${API_BASE}/rooms/${roomId}/messages`, {
+        method: 'POST',
+        ...(await authHeaders()),
+        body: JSON.stringify({
+          text: t,
+          phase: stage,
+          personaIndex: activePersona,
+          emoji, // include chosen emoji so others see correct identity
+        }),
+      });
+    } catch (e) {
+      console.error('[Room] send error', e);
+    }
+    setText('');
+
+    // 2) If they addressed Asema…
+    if (addressedAsema) {
+      // In ROUGH_DRAFT: "Asema, generate rough draft" → trigger same as button
+      if (stage === 'ROUGH_DRAFT' && wantsRoughDraft) {
+        generateRough('ask'); // fire and forget; UI shows busy state
+      } else {
+        // Normal /ask flow
+        try {
+          await fetch(`${API_BASE}/rooms/${roomId}/ask`, {
+            method: 'POST',
+            ...(await authHeaders()),
+            body: JSON.stringify({ text: t }),
+          });
+        } catch (e) {
+          console.error('[Room] ask error', e);
+        }
+      }
+    }
+
+    // 3) Idea summary trigger (server throttles)
+    if (stage === 'DISCOVERY' || stage === 'IDEA_DUMP' || stage === 'PLANNING') {
+      try {
+        await fetch(`${API_BASE}/rooms/${roomId}/ideas/trigger`, {
+          method: 'POST',
+          ...(await authHeaders()),
+        });
+      } catch (e) {
+        console.warn('[Room] ideas/trigger error', e);
+      }
+    }
+
+    // 4) In FINAL: "done" / "submit" marks ready
+    if (stage === 'FINAL' && /^(done|submit)\b/i.test(t)) {
+      try {
+        await fetch(`${API_BASE}/rooms/${roomId}/final/ready`, {
+          method: 'POST',
+          ...(await authHeaders()),
+        });
+      } catch (e) {
+        console.warn('[Room] final/ready error', e);
+      }
+    }
+  }
+
   // --- Derived UI state ---
   const total = TOTAL_BY_STAGE[stage] || 1;
   const secsLeft = stageEndsAt
@@ -450,11 +659,30 @@ export default function Room() {
   const roundTotal = ORDER.length;
   const statusTopic = roomMeta.topic || voteTopic || 'No topic selected yet';
 
+  const draftingHold = stage === 'ROUGH_DRAFT' && draftBusy;
+
   // Input allowed:
   const canType =
-    !roomMeta.inputLocked ||
-    stage === 'FINAL' ||
-    stage === 'ROUGH_DRAFT';
+    (!roomMeta.inputLocked ||
+      stage === 'FINAL' ||
+      stage === 'ROUGH_DRAFT') &&
+    !draftingHold;
+
+  let inputPlaceholder = 'Type your message… (say "Asema, ..." to ask her)';
+  if (draftingHold) {
+    inputPlaceholder = 'Asema is generating your rough draft…';
+  } else if (!canType && !draftingHold) {
+    inputPlaceholder = 'Input locked in this phase';
+  }
+
+  // Message phase filter: in EDITING, also show ROUGH_DRAFT so they can edit
+  const phaseFilter = (m) => {
+    const phase = m.phase || 'LOBBY';
+    if (stage === 'EDITING') {
+      return phase === 'ROUGH_DRAFT' || phase === 'EDITING';
+    }
+    return phase === stage;
+  };
 
   return (
     <>
@@ -469,42 +697,7 @@ export default function Room() {
           stage={stage}
         />
 
-        {/* Connection health strip */}
-        {connectionStatus !== 'ok' && (
-          <div
-            style={{
-              marginTop: 8,
-              marginBottom: 8,
-              padding: '6px 10px',
-              borderRadius: 999,
-              fontSize: 12,
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 6,
-              background:
-                connectionStatus === 'down'
-                  ? 'rgba(248,113,113,0.18)'
-                  : 'rgba(251,191,36,0.18)',
-              border:
-                connectionStatus === 'down'
-                  ? '1px solid rgba(248,113,113,0.7)'
-                  : '1px solid rgba(251,191,36,0.7)',
-              color: '#fee2e2',
-              maxWidth: '100%',
-            }}
-          >
-            <span style={{ fontSize: 14 }}>
-              {connectionStatus === 'down' ? '⚠️' : '⚡️'}
-            </span>
-            <span style={{ whiteSpace: 'normal' }}>
-              {connectionStatus === 'down'
-                ? 'Disconnected — retrying in the background. Your messages will send once we reconnect.'
-                : 'Network is unstable — reconnecting…'}
-            </span>
-          </div>
-        )}
-
-        {/* Compact status strip for facilitators & participants */}
+        {/* Status strip */}
         <div className="status-strip">
           <span className="status-chip">
             Round <b>{roundIndex}</b> of <b>{roundTotal}</b>
@@ -568,6 +761,7 @@ export default function Room() {
                       key={i}
                       className={i === activePersona ? 'active' : ''}
                       onClick={() => setActivePersona(i)}
+                      disabled={draftingHold}
                     >
                       {p}
                     </button>
@@ -576,12 +770,24 @@ export default function Room() {
               </div>
             </div>
 
+            {/* Editing tip bar */}
+            {stage === 'EDITING' && (
+              <div
+                style={{
+                  padding: '6px 14px 0',
+                  fontSize: 12,
+                  opacity: 0.78,
+                }}
+              >
+                ✏️ Use the rough draft above as your clay. Suggest line edits, cuts, and additions —
+                or ask Asema for alternate versions of specific sentences.
+              </div>
+            )}
+
             {/* Messages */}
             <div ref={scrollRef} className="chat-body">
               {messages
-                .filter(
-                  (m) => (m.phase || 'LOBBY') === stage
-                )
+                .filter(phaseFilter)
                 .map((m) => (
                   <ChatMessage
                     key={m.id}
@@ -603,6 +809,37 @@ export default function Room() {
                 ))}
             </div>
 
+            {/* Tiny "Asema is drafting…" chip above input */}
+            {draftingHold && (
+              <div
+                style={{
+                  margin: '0 12px 6px',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  padding: '6px 10px',
+                  borderRadius: 999,
+                  fontSize: 12,
+                  background: 'rgba(240,200,107,0.12)',
+                  border: '1px solid rgba(240,200,107,0.45)',
+                  color: '#f9fafb',
+                }}
+                aria-live="polite"
+              >
+                <span
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: '50%',
+                    background:
+                      'radial-gradient(circle at 30% 30%, #fffbeb, #facc15)',
+                    boxShadow: '0 0 8px rgba(250,204,21,0.9)',
+                  }}
+                />
+                Asema is generating your rough draft…
+              </div>
+            )}
+
             {/* Input dock */}
             <div className="chat-input">
               <div className="persona-pill">
@@ -617,11 +854,7 @@ export default function Room() {
                 style={{ opacity: canType ? 1 : 0.5 }}
               >
                 <input
-                  placeholder={
-                    canType
-                      ? 'Type your message… (say "Asema, ..." to ask her)'
-                      : 'Input locked in this phase'
-                  }
+                  placeholder={inputPlaceholder}
                   value={text}
                   onChange={(e) => setText(e.target.value)}
                   onKeyDown={(e) =>
@@ -635,18 +868,34 @@ export default function Room() {
               <button
                 className="btn primary"
                 onClick={send}
-                disabled={!canType}
+                disabled={!canType || !text.trim()}
               >
                 Send
               </button>
             </div>
           </div>
 
-          {/* Idea Sidebar (Discovery / Idea Dump / Planning) */}
+          {/* Right-hand column: Idea Board + Planning Blueprint */}
           {(stage === 'DISCOVERY' ||
             stage === 'IDEA_DUMP' ||
             stage === 'PLANNING') && (
-            <IdeaSidebar summary={ideaSummary} />
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 10,
+              }}
+            >
+              <IdeaSidebar summary={ideaSummary} />
+              {stage === 'PLANNING' && (
+                <PlanningSidebar
+                  stage={stage}
+                  outline={outline}
+                  suggestions={planningSuggestions}
+                  onChoose={handleOutlineChoice}
+                />
+              )}
+            </div>
           )}
         </div>
 
@@ -700,9 +949,12 @@ export default function Room() {
           {stage === 'ROUGH_DRAFT' && (
             <button
               className="btn"
-              onClick={generateRough}
+              onClick={() => generateRough()}
+              disabled={draftBusy}
             >
-              {hasDraft
+              {draftBusy
+                ? 'Generating Rough Draft…'
+                : hasDraft
                 ? 'Regenerate Rough Draft'
                 : 'Generate Rough Draft'}
             </button>
@@ -728,7 +980,7 @@ export default function Room() {
         </div>
       </div>
 
-      {/* --- Voting Modal (Discovery) --- */}
+      {/* Voting Modal (Discovery) */}
       {stage === 'DISCOVERY' && voteOpen && (
         <div
           className="fixed inset-0 z-50"
