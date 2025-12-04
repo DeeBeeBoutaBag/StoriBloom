@@ -9,7 +9,17 @@ import CountdownRing from '../components/CountdownRing.jsx';
 import ChatMessage from '../components/ChatMessage.jsx';
 import IdeaSidebar from '../components/IdeaSidebar.jsx';
 
-const ORDER = ['LOBBY','DISCOVERY','IDEA_DUMP','PLANNING','ROUGH_DRAFT','EDITING','FINAL'];
+const ORDER = [
+  'LOBBY',
+  'DISCOVERY',
+  'IDEA_DUMP',
+  'PLANNING',
+  'ROUGH_DRAFT',
+  'EDITING',
+  'FINAL',
+  'CLOSED', // NEW: closed stage
+];
+
 const TOTAL_BY_STAGE = {
   LOBBY: 60,
   DISCOVERY: 600,
@@ -18,6 +28,7 @@ const TOTAL_BY_STAGE = {
   ROUGH_DRAFT: 240,
   EDITING: 600,
   FINAL: 360,
+  CLOSED: 0,
 };
 
 // Small helper for mm:ss display in status strip
@@ -37,6 +48,7 @@ const STAGE_DESCRIPTIONS = {
   ROUGH_DRAFT: 'Asema drafts a first version from your ideas.',
   EDITING: 'Team revises, sharpens, and corrects the draft.',
   FINAL: 'Final touches and “we’re done” check-in.',
+  CLOSED: 'Session is complete, scroll and copy your abstract.',
 };
 
 function StageLegendPill({ stage, open, onToggle }) {
@@ -91,137 +103,6 @@ function StageLegendPill({ stage, open, onToggle }) {
   );
 }
 
-// --- Planning Sidebar: dynamic story blueprint for PLANNING stage ---
-function PlanningSidebar({ stage, outline, suggestions, onChoose }) {
-  if (stage !== 'PLANNING') return null;
-
-  const fields = [
-    { key: 'protagonist', label: 'Protagonist', hint: 'Who is the main character?' },
-    { key: 'goal', label: 'Goal', hint: 'What do they want most?' },
-    { key: 'obstacle', label: 'Obstacle', hint: 'What stands in their way?' },
-    { key: 'setting', label: 'Setting', hint: 'Where does this unfold?' },
-    { key: 'tone', label: 'Tone', hint: 'What is the emotional vibe?' },
-  ];
-
-  const complete = fields.filter((f) => outline[f.key]).length;
-
-  return (
-    <div
-      style={{
-        minWidth: 280,
-        maxWidth: 320,
-        alignSelf: 'stretch',
-        backdropFilter: 'blur(12px)',
-        background: 'rgba(255,255,255,0.05)',
-        border: '1px solid rgba(255,255,255,0.12)',
-        borderRadius: 14,
-        padding: 14,
-        color: '#e5e7eb',
-        fontFamily: 'system-ui, sans-serif',
-        overflowY: 'auto',
-      }}
-    >
-      <div
-        style={{
-          fontWeight: 700,
-          fontSize: 15,
-          color: '#f0c86b',
-          marginBottom: 6,
-          letterSpacing: 0.3,
-        }}
-      >
-        🧭 Story Blueprint ({complete}/5)
-      </div>
-      <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 10 }}>
-        Lock in one clear choice for each piece. Click a suggestion or type your own in chat
-        (start with “Protagonist: …”, “Goal: …”, etc.).
-      </div>
-
-      {fields.map((f) => {
-        const value = outline[f.key];
-        const fieldSuggestions = (suggestions || []).slice(0, 4);
-        return (
-          <div key={f.key} style={{ marginBottom: 10 }}>
-            <div style={{ fontSize: 13, opacity: 0.9 }}>{f.label}</div>
-
-            {value ? (
-              <div
-                style={{
-                  marginTop: 4,
-                  padding: '6px 10px',
-                  borderRadius: 12,
-                  background: 'rgba(240,200,107,0.14)',
-                  border: '1px solid rgba(240,200,107,0.35)',
-                  fontSize: 13,
-                }}
-              >
-                {value}
-              </div>
-            ) : (
-              <>
-                <div
-                  style={{
-                    fontSize: 11,
-                    opacity: 0.7,
-                    marginTop: 2,
-                    marginBottom: 4,
-                  }}
-                >
-                  {f.hint}
-                </div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                  {fieldSuggestions.length ? (
-                    fieldSuggestions.map((s, idx) => (
-                      <button
-                        key={idx}
-                        type="button"
-                        onClick={() => onChoose(f.key, s)}
-                        style={{
-                          borderRadius: 999,
-                          padding: '4px 8px',
-                          border: '1px solid rgba(255,255,255,0.18)',
-                          background: 'rgba(255,255,255,0.06)',
-                          fontSize: 11,
-                          cursor: 'pointer',
-                        }}
-                      >
-                        {s}
-                      </button>
-                    ))
-                  ) : (
-                    <span style={{ fontSize: 11, opacity: 0.6 }}>
-                      Waiting on ideas — add more in chat first.
-                    </span>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
-        );
-      })}
-
-      {complete === 5 && (
-        <div
-          style={{
-            marginTop: 12,
-            padding: 10,
-            borderRadius: 10,
-            background: 'rgba(16,185,129,0.20)',
-            border: '1px solid rgba(16,185,129,0.45)',
-            fontSize: 12,
-          }}
-        >
-          🎉 Your blueprint is locked in. When you’re ready, ask
-          {' '}
-          <b>Asema</b>
-          {' '}
-          for the rough draft or hit “Generate Rough Draft”.
-        </div>
-      )}
-    </div>
-  );
-}
-
 export default function Room() {
   const { roomId } = useParams();
 
@@ -242,15 +123,6 @@ export default function Room() {
   // Messages + ideas
   const [messages, setMessages] = useState([]);
   const [ideaSummary, setIdeaSummary] = useState('');
-
-  // Planning outline (client-side shared blueprint feel)
-  const [outline, setOutline] = useState({
-    protagonist: null,
-    goal: null,
-    obstacle: null,
-    setting: null,
-    tone: null,
-  });
 
   // Compose
   const [text, setText] = useState('');
@@ -284,18 +156,11 @@ export default function Room() {
   const [hasDraft, setHasDraft] = useState(false);
   const [draftBusy, setDraftBusy] = useState(false); // lock while generating
 
+  // Final stage: show button busy while finalizing
+  const [finalBusy, setFinalBusy] = useState(false);
+
   // Legend toggle
   const [legendOpen, setLegendOpen] = useState(false);
-
-  // Suggestions for planning (derived from Idea Board text)
-  const planningSuggestions = useMemo(() => {
-    if (!ideaSummary) return [];
-    return ideaSummary
-      .split('\n')
-      .map((line) => line.trim().replace(/^[-•]\s*/, ''))
-      .filter(Boolean)
-      .slice(0, 12);
-  }, [ideaSummary]);
 
   // --- Auth bootstrap ---
   useEffect(() => {
@@ -500,70 +365,18 @@ export default function Room() {
 
   // --- Finalize button (presenter/manual complete) ---
   async function finalize() {
+    if (finalBusy) return;
+    setFinalBusy(true);
     try {
       await fetch(`${API_BASE}/rooms/${roomId}/final/complete`, {
         method: 'POST',
         ...(await authHeaders()),
       });
+      // Poll loop will pick up stage change to CLOSED + closing messages
     } catch (e) {
       console.error('[Room] finalize error', e);
-    }
-  }
-
-  // --- Planning outline choice handler ---
-  async function handleOutlineChoice(fieldKey, value) {
-    setOutline((prev) => ({
-      ...prev,
-      [fieldKey]: value,
-    }));
-
-    const labelMap = {
-      protagonist: 'protagonist',
-      goal: 'goal',
-      obstacle: 'obstacle',
-      setting: 'setting',
-      tone: 'tone',
-    };
-    const label = labelMap[fieldKey] || fieldKey;
-    const text = `Asema, for our ${label}, let’s lock in: ${value}`;
-
-    const emoji = personas[activePersona] || personas[0];
-
-    try {
-      // Announce choice as a user message in PLANNING
-      await fetch(`${API_BASE}/rooms/${roomId}/messages`, {
-        method: 'POST',
-        ...(await authHeaders()),
-        body: JSON.stringify({
-          text,
-          phase: 'PLANNING',
-          personaIndex: activePersona,
-          emoji,
-        }),
-      });
-    } catch (e) {
-      console.error('[Room] outline choice message error', e);
-    }
-
-    try {
-      // Ask Asema to react / keep momentum
-      await fetch(`${API_BASE}/rooms/${roomId}/ask`, {
-        method: 'POST',
-        ...(await authHeaders()),
-        body: JSON.stringify({ text }),
-      });
-    } catch (e) {
-      console.error('[Room] outline choice ask error', e);
-    }
-
-    // Nudge idea summarizer so rough draft sees these locked choices
-    try {
-      await fetch(`${API_BASE}/rooms/${roomId}/ideas/trigger`, {
-        method: 'POST',
-        ...(await authHeaders()),
-      });
-    } catch (e) {
-      console.warn('[Room] outline ideas/trigger error', e);
+    } finally {
+      setFinalBusy(false);
     }
   }
 
@@ -574,6 +387,9 @@ export default function Room() {
 
     // If draft is generating in ROUGH_DRAFT, block sends to avoid chaos
     if (stage === 'ROUGH_DRAFT' && draftBusy) return;
+
+    // No chat once session is closed
+    if (stage === 'CLOSED') return;
 
     // Respect input lock except FINAL and ROUGH_DRAFT (kept open for collab)
     if (roomMeta.inputLocked && stage !== 'FINAL' && stage !== 'ROUGH_DRAFT') return;
@@ -609,7 +425,8 @@ export default function Room() {
     if (addressedAsema) {
       // In ROUGH_DRAFT: "Asema, generate rough draft" → trigger same as button
       if (stage === 'ROUGH_DRAFT' && wantsRoughDraft) {
-        generateRough('ask'); // fire and forget; UI shows busy state
+        // Fire and forget; UI shows busy state
+        generateRough('ask');
       } else {
         // Normal /ask flow
         try {
@@ -636,7 +453,7 @@ export default function Room() {
       }
     }
 
-    // 4) In FINAL: "done" / "submit" marks ready
+    // 4) In FINAL: "done" / "submit" marks ready (backend should implement /final/ready)
     if (stage === 'FINAL' && /^(done|submit)\b/i.test(t)) {
       try {
         await fetch(`${API_BASE}/rooms/${roomId}/final/ready`, {
@@ -651,9 +468,12 @@ export default function Room() {
 
   // --- Derived UI state ---
   const total = TOTAL_BY_STAGE[stage] || 1;
-  const secsLeft = stageEndsAt
-    ? Math.max(0, Math.floor((stageEndsAt.getTime() - nowTick) / 1000))
-    : 0;
+  const secsLeft =
+    stage === 'CLOSED'
+      ? 0
+      : stageEndsAt
+      ? Math.max(0, Math.floor((stageEndsAt.getTime() - nowTick) / 1000))
+      : 0;
 
   const roundIndex = Math.max(1, ORDER.indexOf(stage) + 1 || 1);
   const roundTotal = ORDER.length;
@@ -663,6 +483,7 @@ export default function Room() {
 
   // Input allowed:
   const canType =
+    stage !== 'CLOSED' &&
     (!roomMeta.inputLocked ||
       stage === 'FINAL' ||
       stage === 'ROUGH_DRAFT') &&
@@ -672,17 +493,14 @@ export default function Room() {
   if (draftingHold) {
     inputPlaceholder = 'Asema is generating your rough draft…';
   } else if (!canType && !draftingHold) {
-    inputPlaceholder = 'Input locked in this phase';
+    inputPlaceholder =
+      stage === 'CLOSED'
+        ? 'Session is closed — scroll up and copy your abstract.'
+        : 'Input locked in this phase';
   }
 
-  // Message phase filter: in EDITING, also show ROUGH_DRAFT so they can edit
-  const phaseFilter = (m) => {
-    const phase = m.phase || 'LOBBY';
-    if (stage === 'EDITING') {
-      return phase === 'ROUGH_DRAFT' || phase === 'EDITING';
-    }
-    return phase === stage;
-  };
+  // When CLOSED, show FINAL-phase transcript (closing message + abstract)
+  const effectivePhase = stage === 'CLOSED' ? 'FINAL' : stage;
 
   return (
     <>
@@ -700,11 +518,27 @@ export default function Room() {
         {/* Status strip */}
         <div className="status-strip">
           <span className="status-chip">
-            Round <b>{roundIndex}</b> of <b>{roundTotal}</b>
+            {stage === 'CLOSED' ? (
+              <>
+                Session <b>Complete</b>
+              </>
+            ) : (
+              <>
+                Round <b>{roundIndex}</b> of <b>{roundTotal}</b>
+              </>
+            )}
           </span>
           <span className="status-dot">•</span>
           <span className="status-chip">
-            Time left: <b>{formatTime(secsLeft)}</b>
+            {stage === 'CLOSED' ? (
+              <>
+                Time left: <b>0:00</b>
+              </>
+            ) : (
+              <>
+                Time left: <b>{formatTime(secsLeft)}</b>
+              </>
+            )}
           </span>
           <span className="status-dot">•</span>
           <span className="status-topic" title={statusTopic}>
@@ -728,7 +562,9 @@ export default function Room() {
           <div className="chat">
             {/* Header */}
             <div className="chat-head">
-              <span className="stage-badge">{stage}</span>
+              <span className="stage-badge">
+                {stage === 'CLOSED' ? 'SESSION COMPLETE' : stage}
+              </span>
               <div className="ribbon" style={{ marginLeft: 10 }}>
                 {ORDER.map((s) => (
                   <span
@@ -750,7 +586,7 @@ export default function Room() {
               >
                 <CountdownRing
                   secondsLeft={secsLeft}
-                  secondsTotal={total}
+                  secondsTotal={total || 1}
                 />
                 <div
                   className="persona-choices"
@@ -761,7 +597,7 @@ export default function Room() {
                       key={i}
                       className={i === activePersona ? 'active' : ''}
                       onClick={() => setActivePersona(i)}
-                      disabled={draftingHold}
+                      disabled={draftingHold || stage === 'CLOSED'}
                     >
                       {p}
                     </button>
@@ -770,24 +606,12 @@ export default function Room() {
               </div>
             </div>
 
-            {/* Editing tip bar */}
-            {stage === 'EDITING' && (
-              <div
-                style={{
-                  padding: '6px 14px 0',
-                  fontSize: 12,
-                  opacity: 0.78,
-                }}
-              >
-                ✏️ Use the rough draft above as your clay. Suggest line edits, cuts, and additions —
-                or ask Asema for alternate versions of specific sentences.
-              </div>
-            )}
-
             {/* Messages */}
             <div ref={scrollRef} className="chat-body">
               {messages
-                .filter(phaseFilter)
+                .filter(
+                  (m) => (m.phase || 'LOBBY') === effectivePhase
+                )
                 .map((m) => (
                   <ChatMessage
                     key={m.id}
@@ -843,10 +667,18 @@ export default function Room() {
             {/* Input dock */}
             <div className="chat-input">
               <div className="persona-pill">
-                Speaking as{' '}
-                <b style={{ fontSize: 16 }}>
-                  {personas[activePersona] || personas[0]}
-                </b>
+                {stage === 'CLOSED' ? (
+                  <b style={{ fontSize: 16 }}>
+                    Session closed — copy your abstract above.
+                  </b>
+                ) : (
+                  <>
+                    Speaking as{' '}
+                    <b style={{ fontSize: 16 }}>
+                      {personas[activePersona] || personas[0]}
+                    </b>
+                  </>
+                )}
               </div>
 
               <div
@@ -875,27 +707,11 @@ export default function Room() {
             </div>
           </div>
 
-          {/* Right-hand column: Idea Board + Planning Blueprint */}
+          {/* Idea Sidebar (Discovery / Idea Dump / Planning) */}
           {(stage === 'DISCOVERY' ||
             stage === 'IDEA_DUMP' ||
             stage === 'PLANNING') && (
-            <div
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 10,
-              }}
-            >
-              <IdeaSidebar summary={ideaSummary} />
-              {stage === 'PLANNING' && (
-                <PlanningSidebar
-                  stage={stage}
-                  outline={outline}
-                  suggestions={planningSuggestions}
-                  onChoose={handleOutlineChoice}
-                />
-              )}
-            </div>
+            <IdeaSidebar summary={ideaSummary} />
           )}
         </div>
 
@@ -964,12 +780,24 @@ export default function Room() {
             <button
               className="btn primary"
               onClick={finalize}
+              disabled={finalBusy}
             >
-              Finalize
+              {finalBusy
+                ? 'Finalizing Session…'
+                : 'Finalize Session'}
             </button>
           )}
 
-          {roomMeta.inputLocked && (
+          {stage === 'CLOSED' && (
+            <div
+              className="hud-pill"
+              style={{ marginLeft: 'auto' }}
+            >
+              Session complete — scroll to review and copy your abstract.
+            </div>
+          )}
+
+          {roomMeta.inputLocked && stage !== 'CLOSED' && (
             <div
               className="hud-pill"
               style={{ marginLeft: 'auto' }}
