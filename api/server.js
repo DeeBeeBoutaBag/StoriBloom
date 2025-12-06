@@ -372,6 +372,55 @@ async function generateRoughDraftForRoom(room, { force = false } = {}) {
   }
 }
 
+// Pick the best "final" text for the room, preferring EDITING-phase messages
+// (usually the polished abstract) and falling back to the latest rough draft
+// or ideaSummary if needed.
+async function getBestFinalText(roomId) {
+  // All messages for this room
+  const all = await getMessagesForRoom(roomId, 800);
+
+  let editingCandidate = null;
+  let editingAsemaCandidate = null;
+
+  // Walk from newest → oldest
+  for (let i = all.length - 1; i >= 0; i--) {
+    const m = all[i];
+    const phase = m.phase || '';
+    if (phase !== 'EDITING') continue;
+    const txt = (m.text || '').trim();
+    if (!txt) continue;
+
+    // Prefer Asema’s last EDITING message if present
+    if (m.authorType === 'asema' && !editingAsemaCandidate) {
+      editingAsemaCandidate = txt;
+      break; // strongest candidate
+    }
+
+    // Otherwise remember the last EDITING message from anyone
+    if (!editingCandidate) {
+      editingCandidate = txt;
+    }
+  }
+
+  if (editingAsemaCandidate) return editingAsemaCandidate;
+  if (editingCandidate) return editingCandidate;
+
+  // If nobody rewrote it in EDITING, fall back to latest saved draft
+  const latestDraft = await getLatestDraft(roomId);
+  if (latestDraft && latestDraft.content && latestDraft.content.trim()) {
+    return latestDraft.content.trim();
+  }
+
+  // Last fallback: the ideaSummary (shorter, but better than nothing)
+  const room = await ensureRoom(roomId);
+  if (room.ideaSummary && room.ideaSummary.trim()) {
+    return room.ideaSummary.trim();
+  }
+
+  return '';
+}
+
+
 // ---------- Room Assignment (6 per room, up to 5 rooms) ----------
 async function assignRoomForUser(siteIdRaw, uid) {
   const siteId = String(siteIdRaw || '').trim().toUpperCase();
@@ -952,15 +1001,14 @@ app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
         .json({ error: 'wrong_stage', stage });
     }
 
-    // How many people clicked "done" vs total seats
     const readyCount = Number(room.finalReadyCount || 0);
     const seats = Array.isArray(room.seats) ? room.seats.length : 0;
 
-    // 1) Try to get the latest rough draft as base text
-    const latestDraft = await getLatestDraft(roomId);
-    const baseDraft = latestDraft && latestDraft.content ? latestDraft.content.trim() : '';
+    // 🔑 Pull the best final text (EDITING → rough draft → ideaSummary)
+    const finalText = await getBestFinalText(roomId);
+    const hasFinal = !!finalText && finalText.trim().length > 0;
 
-    // 2) Drop a closing ceremony message from Asema
+    // 1) Closing ceremony message
     const closingLines = [];
     closingLines.push('🏁 **Session complete.** Beautiful work, team.');
     if (seats > 0) {
@@ -969,10 +1017,10 @@ app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
       );
     }
     if (room.topic) {
-      closingLines.push(`We just wrapped a story on **${room.topic}**.`);
+      closingLines.push(`You just wrapped a story on **${room.topic}**.`);
     }
     closingLines.push(
-      'You can screenshot or copy your final abstract below, and keep this as a seed for a full piece or performance.'
+      'Screenshot or copy your final abstract below — this is your group’s shared version. Build on it after the workshop.'
     );
 
     await addMessage(roomId, {
@@ -982,24 +1030,24 @@ app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
       personaIndex: 0,
     });
 
-    // 3) Re-post the final abstract clearly labeled
-    if (baseDraft) {
+    // 2) Paste the actual final abstract
+    if (hasFinal) {
       await addMessage(roomId, {
-        text: `**Final Abstract**\n\n${baseDraft}`,
+        text: `**Final Abstract**\n\n${finalText}`,
         phase: 'FINAL',
         authorType: 'asema',
         personaIndex: 0,
       });
     } else {
       await addMessage(roomId, {
-        text: 'I don’t see a saved rough draft — your chat log is still full of good material. Copy what you like and keep building it offline.',
+        text: 'I couldn’t find a full edited abstract — your chat log is still full of strong lines. Copy what you like and keep writing offline.',
         phase: 'FINAL',
         authorType: 'asema',
         personaIndex: 0,
       });
     }
 
-    // 4) Lock and close the room
+    // 3) Lock + close
     const finalCompletedAt = Date.now();
     const updated = await updateRoom(roomId, {
       stage: 'CLOSED',
