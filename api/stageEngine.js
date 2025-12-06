@@ -20,13 +20,13 @@ const TOUCH_TTL_MS = 30 * 60_000; // stop tracking room if idle 30m
 
 // Keep durations aligned with server.js STAGE_DURATIONS (ms)
 export const STAGE_DURATIONS = {
-  LOBBY: 10 * 60_000,       // 10 min
-  DISCOVERY: 10 * 60_000,   // 10 min
-  IDEA_DUMP: 3 * 60_000,    // 3 min
-  PLANNING: 10 * 60_000,    // 10 min
-  ROUGH_DRAFT: 4 * 60_000,  // 4 min
-  EDITING: 10 * 60_000,     // 10 min
-  FINAL: 6 * 60_000,        // 6 min
+  LOBBY: 15 * 60_000,       // 10 min
+  DISCOVERY: 4 * 60_000,   // 10 min
+  IDEA_DUMP: 4 * 60_000,    // 3 min
+  PLANNING: 4 * 60_000,    // 10 min
+  ROUGH_DRAFT: 2 * 60_000,  // 4 min
+  EDITING: 4 * 60_000,     // 10 min
+  FINAL: 3 * 60_000,        // 6 min
 };
 
 function getDurationForStage(stage) {
