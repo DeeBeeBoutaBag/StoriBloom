@@ -160,13 +160,13 @@ const ROOM_ORDER = [
 
 // Align durations more closely with UI (Room.jsx TOTAL_BY_STAGE)
 const STAGE_DURATIONS = {
-  LOBBY: 10 * 60_000,       // 10 min
-  DISCOVERY: 10 * 60_000,   // 10 min
-  IDEA_DUMP: 3 * 60_000,    // 3 min
-  PLANNING: 10 * 60_000,    // 10 min
-  ROUGH_DRAFT: 4 * 60_000,  // 4 min
-  EDITING: 10 * 60_000,     // 10 min
-  FINAL: 6 * 60_000,        // 6 min
+  LOBBY: 15 * 60_000,       // 10 min
+  DISCOVERY: 4 * 60_000,   // 10 min
+  IDEA_DUMP: 4 * 60_000,    // 3 min
+  PLANNING: 4 * 60_000,    // 10 min
+  ROUGH_DRAFT: 3 * 60_000,  // 4 min
+  EDITING: 4 * 60_000,     // 10 min
+  FINAL: 3 * 60_000,        // 6 min
 };
 function getStageDuration(stage) {
   return STAGE_DURATIONS[stage] || 6 * 60_000;
