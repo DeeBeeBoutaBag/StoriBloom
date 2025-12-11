@@ -160,13 +160,13 @@ const ROOM_ORDER = [
 
 // Align durations more closely with UI (Room.jsx TOTAL_BY_STAGE)
 const STAGE_DURATIONS = {
-  LOBBY: 15 * 60_000,       // 10 min
-  DISCOVERY: 4 * 60_000,   // 10 min
-  IDEA_DUMP: 4 * 60_000,    // 3 min
-  PLANNING: 4 * 60_000,    // 10 min
-  ROUGH_DRAFT: 3 * 60_000,  // 4 min
-  EDITING: 4 * 60_000,     // 10 min
-  FINAL: 3 * 60_000,        // 6 min
+  LOBBY: 15 * 60_000,      // 15 min
+  DISCOVERY: 4 * 60_000,   // 4 min
+  IDEA_DUMP: 4 * 60_000,   // 4 min
+  PLANNING: 4 * 60_000,    // 4 min
+  ROUGH_DRAFT: 3 * 60_000, // 3 min
+  EDITING: 4 * 60_000,     // 4 min
+  FINAL: 3 * 60_000,       // 3 min
 };
 function getStageDuration(stage) {
   return STAGE_DURATIONS[stage] || 6 * 60_000;
@@ -182,6 +182,10 @@ function advanceStageVal(stage) {
   return i >= 0 && i < ROOM_ORDER.length - 1
     ? ROOM_ORDER[i + 1]
     : (stage || DEFAULT_STAGE);
+}
+
+function getSeatCount(room) {
+  return Array.isArray(room.seats) ? room.seats.length : 0;
 }
 
 async function getRoom(roomId) {
@@ -213,6 +217,12 @@ async function ensureRoom(roomId) {
     voteTallies: {},
     greetedForStage: {},
     seats: [], // track occupancy
+
+    // NEW: voting readiness + submitted tracking
+    voteReadyUids: [],
+    voteReadyCount: 0,
+    voteSubmittedUids: [],
+    voteSubmittedCount: 0,
 
     // NEW: final-stage tracking
     finalReadyUids: [],
@@ -592,7 +602,7 @@ app.get('/presenter/rooms', requireAuth, async (req, res) => {
       stage: r.stage,
       inputLocked: !!r.inputLocked,
       topic: r.topic || '',
-      seats: Array.isArray(r.seats) ? r.seats.length : 0,
+      seats: getSeatCount(r),
       vote: {
         open: !!r.voteOpen,
         total: Number(r.voteTotal || 0),
@@ -642,7 +652,7 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
     ideaSummary: r.ideaSummary || '',
 
     // NEW
-    seats: Array.isArray(r.seats) ? r.seats.length : 0,
+    seats: getSeatCount(r),
     finalReadyCount: Number(r.finalReadyCount || 0),
     finalCompletedAt: r.finalCompletedAt || null,
   });
@@ -741,6 +751,70 @@ const ISSUE_MAP = {
   5: 'Wealth Gap',
 };
 
+// Participant clicks "Ready to vote" in DISCOVERY.
+// Once >= 50% of seats are ready, voting opens automatically.
+app.post('/rooms/:roomId/vote/ready', requireAuth, async (req, res) => {
+  const roomId = req.params.roomId;
+  const uid = req.user?.uid;
+  if (!uid) return res.status(401).json({ error: 'no_uid' });
+
+  const room = await ensureRoom(roomId);
+  const stage = room.stage || 'LOBBY';
+  if (stage !== 'DISCOVERY') {
+    return res.status(400).json({ error: 'wrong_stage', stage });
+  }
+
+  let readyUids = Array.isArray(room.voteReadyUids)
+    ? room.voteReadyUids.slice()
+    : [];
+  if (!readyUids.includes(uid)) {
+    readyUids.push(uid);
+  }
+
+  const seats = getSeatCount(room);
+  const voteReadyCount = readyUids.length;
+  const threshold = seats > 0 ? Math.ceil(seats * 0.5) : 0;
+
+  let patch = {
+    voteReadyUids: readyUids,
+    voteReadyCount,
+  };
+
+  // When at least half the room is ready and voting isn't open yet,
+  // open the topic vote automatically.
+  if (!room.voteOpen && threshold > 0 && voteReadyCount >= threshold) {
+    patch = {
+      ...patch,
+      voteOpen: true,
+      voteTotal: 0,
+      voteTallies: {},
+      voteSubmittedUids: [],
+      voteSubmittedCount: 0,
+    };
+
+    // Optional: drop a quick Asema message announcing the vote
+    try {
+      await addMessage(roomId, {
+        text: '🗳️ At least half the room is ready — opening topic voting now. Pick one option that fits your story best.',
+        phase: 'DISCOVERY',
+        authorType: 'asema',
+        personaIndex: 0,
+      });
+    } catch (e) {
+      console.warn('[vote/ready] Asema announcement failed', e);
+    }
+  }
+
+  const updated = await updateRoom(roomId, patch);
+
+  return res.json({
+    ok: true,
+    votingOpen: !!updated.voteOpen,
+    voteReadyCount: updated.voteReadyCount || 0,
+    seats,
+  });
+});
+
 app.get('/rooms/:roomId/vote', requireAuth, async (req, res) => {
   const r = await ensureRoom(req.params.roomId);
   stageEngine.touch(r.roomId);
@@ -756,7 +830,12 @@ app.get('/rooms/:roomId/vote', requireAuth, async (req, res) => {
       : 0
   );
 
-  const votesReceived = counts.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
+  const votesReceived = counts.reduce(
+    (a, b) => a + (Number.isFinite(b) ? b : 0),
+    0
+  );
+
+  const seats = getSeatCount(r);
 
   res.json({
     votingOpen: !!r.voteOpen,
@@ -764,21 +843,39 @@ app.get('/rooms/:roomId/vote', requireAuth, async (req, res) => {
     votesReceived,
     counts,
     topic: r.topic || '',
+    // NEW
+    voteReadyCount: Number(r.voteReadyCount || 0),
+    voteSubmittedCount: Number(r.voteSubmittedCount || 0),
+    seats,
   });
 });
 
 app.post('/rooms/:roomId/vote/start', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
-  await updateRoom(roomId, { voteOpen: true, voteTotal: 0, voteTallies: {} });
+  await updateRoom(roomId, {
+    voteOpen: true,
+    voteTotal: 0,
+    voteTallies: {},
+    voteReadyUids: [],
+    voteReadyCount: 0,
+    voteSubmittedUids: [],
+    voteSubmittedCount: 0,
+  });
   res.json({ ok: true, started: true });
 });
 
 app.post('/rooms/:roomId/vote/submit', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const { choice } = req.body || {};
+  const uid = req.user?.uid;
+
   if (typeof choice !== 'number') {
     return res.status(400).json({ error: 'choice must be a number' });
   }
+  if (!uid) {
+    return res.status(401).json({ error: 'no_uid' });
+  }
+
   const r = await ensureRoom(roomId);
   if (!r.voteOpen) return res.status(400).json({ error: 'voting_closed' });
 
@@ -786,11 +883,62 @@ app.post('/rooms/:roomId/vote/submit', requireAuth, async (req, res) => {
   const key = Number(choice);
   tallies[key] = (tallies[key] || 0) + 1;
 
-  await updateRoom(roomId, {
+  let voteSubmittedUids = Array.isArray(r.voteSubmittedUids)
+    ? r.voteSubmittedUids.slice()
+    : [];
+  if (!voteSubmittedUids.includes(uid)) {
+    voteSubmittedUids.push(uid);
+  }
+  const voteSubmittedCount = voteSubmittedUids.length;
+
+  const voteTotal = Number(r.voteTotal || 0) + 1;
+  const seats = getSeatCount(r);
+
+  // First update with new tallies + submissions
+  let updated = await updateRoom(roomId, {
     voteTallies: tallies,
-    voteTotal: Number(r.voteTotal || 0) + 1,
+    voteTotal,
+    voteSubmittedUids,
+    voteSubmittedCount,
   });
-  res.json({ ok: true });
+
+  // If all seated participants have voted, auto-close and set topic
+  if (seats > 0 && voteSubmittedCount >= seats && updated.voteOpen) {
+    const entries = Object.entries(tallies);
+    let topic = updated.topic || '';
+
+    if (entries.length) {
+      entries.sort((a, b) => (b[1] || 0) - (a[1] || 0));
+      const [winningNum] = entries[0];
+      const label = ISSUE_MAP[Number(winningNum)];
+      topic = label || `#${winningNum}`;
+    }
+
+    updated = await updateRoom(roomId, {
+      voteOpen: false,
+      topic,
+    });
+
+    // Optional: announce locked topic
+    try {
+      await addMessage(roomId, {
+        text: `🔒 Topic locked in: **${topic}** — keep everything focused around this issue as you move forward.`,
+        phase: 'DISCOVERY',
+        authorType: 'asema',
+        personaIndex: 0,
+      });
+    } catch (e) {
+      console.warn('[vote/submit] Asema topic announce failed', e);
+    }
+  }
+
+  res.json({
+    ok: true,
+    voteSubmittedCount,
+    seats,
+    votingOpen: !!updated.voteOpen,
+    topic: updated.topic || '',
+  });
 });
 
 app.post('/rooms/:roomId/vote/close', requireAuth, async (req, res) => {
@@ -989,80 +1137,112 @@ app.post('/rooms/:roomId/draft/generate', requireAuth, async (req, res) => {
 app.post('/rooms/:roomId/final/start', requireAuth, async (_req, res) =>
   res.json({ ok: true })
 );
-app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
-  const roomId = req.params.roomId;
 
-  try {
-    const room = await ensureRoom(roomId);
-    const stage = room.stage || 'LOBBY';
-    if (stage !== 'FINAL') {
-      return res
-        .status(400)
-        .json({ error: 'wrong_stage', stage });
-    }
+// Helper to finalize a room (closing ceremony + final abstract)
+async function finalizeRoom(roomId) {
+  const room = await ensureRoom(roomId);
+  const stage = room.stage || 'LOBBY';
 
-    const readyCount = Number(room.finalReadyCount || 0);
-    const seats = Array.isArray(room.seats) ? room.seats.length : 0;
+  // If already closed, just echo back
+  if (stage === 'CLOSED') {
+    const seatsClosed = getSeatCount(room);
+    return {
+      ok: true,
+      closed: true,
+      stage: room.stage,
+      finalCompletedAt: room.finalCompletedAt || Date.now(),
+      readyCount: Number(room.finalReadyCount || 0),
+      seats: seatsClosed,
+      alreadyClosed: true,
+    };
+  }
 
-    // 🔑 Pull the best final text (EDITING → rough draft → ideaSummary)
-    const finalText = await getBestFinalText(roomId);
-    const hasFinal = !!finalText && finalText.trim().length > 0;
+  if (stage !== 'FINAL') {
+    return {
+      ok: false,
+      wrongStage: true,
+      stage,
+    };
+  }
 
-    // 1) Closing ceremony message
-    const closingLines = [];
-    closingLines.push('🏁 **Session complete.** Beautiful work, team.');
-    if (seats > 0) {
-      closingLines.push(
-        `**${readyCount} / ${seats}** teammates clicked **done** — that’s your consensus on this abstract.`
-      );
-    }
-    if (room.topic) {
-      closingLines.push(`You just wrapped a story on **${room.topic}**.`);
-    }
+  const readyCount = Number(room.finalReadyCount || 0);
+  const seats = getSeatCount(room);
+
+  // 🔑 Pull the best final text (EDITING → rough draft → ideaSummary)
+  const finalText = await getBestFinalText(roomId);
+  const hasFinal = !!finalText && finalText.trim().length > 0;
+
+  // 1) Closing ceremony message
+  const closingLines = [];
+  closingLines.push('🏁 **Session complete.** Beautiful work, team.');
+  if (seats > 0) {
     closingLines.push(
-      'Screenshot or copy your final abstract below — this is your group’s shared version. Build on it after the workshop.'
+      `**${readyCount} / ${seats}** teammates clicked **done** — that’s your consensus on this abstract.`
     );
+  }
+  if (room.topic) {
+    closingLines.push(`You just wrapped a story on **${room.topic}**.`);
+  }
+  closingLines.push(
+    'Screenshot or copy your final abstract below — this is your group’s shared version. Build on it after the workshop.'
+  );
 
+  await addMessage(roomId, {
+    text: closingLines.join(' '),
+    phase: 'FINAL',
+    authorType: 'asema',
+    personaIndex: 0,
+  });
+
+  // 2) Paste the actual final abstract
+  if (hasFinal) {
     await addMessage(roomId, {
-      text: closingLines.join(' '),
+      text: `**Final Abstract**\n\n${finalText}`,
       phase: 'FINAL',
       authorType: 'asema',
       personaIndex: 0,
     });
+  } else {
+    await addMessage(roomId, {
+      text:
+        'I couldn’t find a full edited abstract — your chat log is still full of strong lines. Copy what you like and keep writing offline.',
+      phase: 'FINAL',
+      authorType: 'asema',
+      personaIndex: 0,
+    });
+  }
 
-    // 2) Paste the actual final abstract
-    if (hasFinal) {
-      await addMessage(roomId, {
-        text: `**Final Abstract**\n\n${finalText}`,
-        phase: 'FINAL',
-        authorType: 'asema',
-        personaIndex: 0,
-      });
-    } else {
-      await addMessage(roomId, {
-        text: 'I couldn’t find a full edited abstract — your chat log is still full of strong lines. Copy what you like and keep writing offline.',
-        phase: 'FINAL',
-        authorType: 'asema',
-        personaIndex: 0,
-      });
+  // 3) Lock + close
+  const finalCompletedAt = Date.now();
+  const updated = await updateRoom(roomId, {
+    stage: 'CLOSED',
+    inputLocked: true,
+    finalCompletedAt,
+  });
+
+  return {
+    ok: true,
+    closed: true,
+    stage: updated.stage,
+    finalCompletedAt,
+    readyCount,
+    seats,
+  };
+}
+
+app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
+  const roomId = req.params.roomId;
+
+  try {
+    const result = await finalizeRoom(roomId);
+
+    if (result.wrongStage) {
+      return res
+        .status(400)
+        .json({ error: 'wrong_stage', stage: result.stage });
     }
 
-    // 3) Lock + close
-    const finalCompletedAt = Date.now();
-    const updated = await updateRoom(roomId, {
-      stage: 'CLOSED',
-      inputLocked: true,
-      finalCompletedAt,
-    });
-
-    return res.json({
-      ok: true,
-      closed: true,
-      stage: updated.stage,
-      finalCompletedAt,
-      readyCount,
-      seats,
-    });
+    return res.json(result);
   } catch (e) {
     console.error('[final/complete] error', e);
     return res.status(500).json({ error: 'final_complete_failed' });
@@ -1084,17 +1264,37 @@ app.post('/rooms/:roomId/final/ready', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'wrong_stage', stage });
   }
 
-  let readyUids = Array.isArray(r.finalReadyUids) ? r.finalReadyUids.slice() : [];
+  let readyUids = Array.isArray(r.finalReadyUids)
+    ? r.finalReadyUids.slice()
+    : [];
   if (!readyUids.includes(uid)) {
     readyUids.push(uid);
   }
 
+  const seats = getSeatCount(r);
+  const finalReadyCount = readyUids.length;
+
   const updated = await updateRoom(roomId, {
     finalReadyUids: readyUids,
-    finalReadyCount: readyUids.length,
+    finalReadyCount,
   });
 
-  const seats = Array.isArray(updated.seats) ? updated.seats.length : 0;
+  const threshold = seats > 0 ? Math.ceil(seats * 0.5) : 0;
+
+  // If at least half the room has typed "done", auto-finalize the session
+  if (threshold > 0 && finalReadyCount >= threshold) {
+    try {
+      const result = await finalizeRoom(roomId);
+      return res.json({
+        ok: true,
+        autoClosed: true,
+        ...result,
+      });
+    } catch (e) {
+      console.error('[final/ready] auto finalize error', e);
+      // fall through and at least return ready counts
+    }
+  }
 
   return res.json({
     ok: true,

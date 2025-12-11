@@ -143,20 +143,21 @@ export default function Room() {
   const [sentWelcome, setSentWelcome] = useState(false);
 
   // Voting (frontend glue; backend handles real logic)
-  const [voteOpen, setVoteOpen] = useState(false);
+  const [voteOpen, setVoteOpen] = useState(false);          // backend: votingOpen
+  const [voteModalOpen, setVoteModalOpen] = useState(false); // local: modal visibility
   const [voteOptions, setVoteOptions] = useState([]);
   const [hasVoted, setHasVoted] = useState(false);
-  const [voteClosesAt, setVoteClosesAt] = useState(null);
   const [voteCounts, setVoteCounts] = useState(null);
   const [voteTopic, setVoteTopic] = useState('');
+  const [voteReadyCount, setVoteReadyCount] = useState(0);
+  const [voteSubmittedCount, setVoteSubmittedCount] = useState(0);
+  const [voteSeats, setVoteSeats] = useState(0);
+  const [hasMarkedReady, setHasMarkedReady] = useState(false);
   const votePollRef = useRef(null);
 
   // Rough draft local flags
   const [hasDraft, setHasDraft] = useState(false);
   const [draftBusy, setDraftBusy] = useState(false); // lock while generating
-
-  // Final stage: show button busy while finalizing
-  const [finalBusy, setFinalBusy] = useState(false);
 
   // Legend toggle
   const [legendOpen, setLegendOpen] = useState(false);
@@ -266,15 +267,19 @@ export default function Room() {
       });
       if (!res.ok) return;
       const j = await res.json();
+      // backend-open flag only if we're in DISCOVERY
       setVoteOpen(!!j.votingOpen && stage === 'DISCOVERY');
       setVoteOptions(Array.isArray(j.options) ? j.options : []);
       setVoteCounts(j.counts || null);
       setVoteTopic(j.topic || '');
+      setVoteReadyCount(Number(j.voteReadyCount || 0));
+      setVoteSubmittedCount(Number(j.voteSubmittedCount || 0));
+      setVoteSeats(j.seats || 0);
+
+      // If voting is closed on backend, clear local modal + voted state
       if (!j.votingOpen) {
         setHasVoted(false);
-        setVoteClosesAt(null);
-      } else if (j.voteClosesAt) {
-        setVoteClosesAt(new Date(j.voteClosesAt));
+        setVoteModalOpen(false);
       }
     } catch (e) {
       console.warn('[Room] fetchVoteStatus error', e);
@@ -319,6 +324,20 @@ export default function Room() {
     }
   }
 
+  // New: mark this participant as "ready to vote"
+  async function markReadyToVote() {
+    try {
+      await fetch(`${API_BASE}/rooms/${roomId}/vote/ready`, {
+        method: 'POST',
+        ...(await authHeaders()),
+      });
+      setHasMarkedReady(true);
+      await fetchVoteStatus();
+    } catch (e) {
+      console.warn('[Room] markReadyToVote error', e);
+    }
+  }
+
   useEffect(() => {
     if (stage !== 'DISCOVERY') {
       if (votePollRef.current) {
@@ -326,6 +345,8 @@ export default function Room() {
         votePollRef.current = null;
       }
       setVoteOpen(false);
+      setVoteModalOpen(false);
+      setHasMarkedReady(false);
       return;
     }
     fetchVoteStatus();
@@ -371,23 +392,6 @@ export default function Room() {
     }
   }
 
-  // --- Finalize button (presenter/manual complete) ---
-  async function finalize() {
-    if (finalBusy) return;
-    setFinalBusy(true);
-    try {
-      await fetch(`${API_BASE}/rooms/${roomId}/final/complete`, {
-        method: 'POST',
-        ...(await authHeaders()),
-      });
-      // Poll loop will pick up stage change to CLOSED + closing messages
-    } catch (e) {
-      console.error('[Room] finalize error', e);
-    } finally {
-      setFinalBusy(false);
-    }
-  }
-
   // --- Planning: share outline as a single chat message ---
   async function sharePlanningOutline() {
     if (planningBusy) return;
@@ -428,7 +432,7 @@ export default function Room() {
         }),
       });
 
-      // keep the fields, or lightly mark that it was shared (no hard reset so they can tweak)
+      // keep the fields so they can tweak the outline
     } catch (e) {
       console.error('[Room] sharePlanningOutline error', e);
     } finally {
@@ -562,6 +566,8 @@ export default function Room() {
   const readyCount = roomMeta.finalReadyCount || 0;
   const totalSeats = roomMeta.seats || 0;
   const readyPct = totalSeats ? Math.round((readyCount / totalSeats) * 100) : 0;
+
+  const displayVoteSeats = voteSeats || roomMeta.seats || 0;
 
   return (
     <>
@@ -874,7 +880,12 @@ export default function Room() {
                 className="btn primary"
                 style={{ marginTop: 4, width: '100%' }}
                 onClick={sharePlanningOutline}
-                disabled={planningBusy || (!planningFocus.trim() && !planningStructure.trim() && !planningKeyPoints.trim())}
+                disabled={
+                  planningBusy ||
+                  (!planningFocus.trim() &&
+                    !planningStructure.trim() &&
+                    !planningKeyPoints.trim())
+                }
               >
                 {planningBusy ? 'Sharing plan…' : 'Share plan with room'}
               </button>
@@ -900,42 +911,57 @@ export default function Room() {
         >
           {stage === 'DISCOVERY' && (
             <>
-              {isPresenter ? (
+              {/* Ready-to-vote + vote controls */}
+              <button
+                className="btn"
+                onClick={markReadyToVote}
+                disabled={hasMarkedReady}
+              >
+                {hasMarkedReady ? 'Waiting for room…' : "I'm ready to vote"}
+              </button>
+
+              {voteOpen && (
+                <button
+                  className="btn"
+                  onClick={() => setVoteModalOpen(true)}
+                  disabled={hasVoted}
+                >
+                  {hasVoted ? 'You voted' : 'Vote Now'}
+                </button>
+              )}
+
+              {isPresenter && (
                 <>
+                  {/* Optional presenter override if needed */}
                   <button
                     className="btn"
                     onClick={startVote}
                   >
-                    Start Vote
+                    Force Start
                   </button>
                   <button
                     className="btn"
                     onClick={closeVote}
                     disabled={!voteOpen}
                   >
-                    Close Vote
+                    Force Close
                   </button>
                 </>
-              ) : (
-                <button
-                  className="btn"
-                  onClick={() => setVoteOpen(true)}
-                  disabled={!voteOpen}
-                >
-                  {voteOpen
-                    ? 'Vote Now'
-                    : 'Waiting for Vote'}
-                </button>
               )}
+
               <div
                 className="hud-pill"
-                style={{ marginLeft: 'auto' }}
+                style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}
               >
-                {roomMeta.topic
-                  ? `Topic: ${roomMeta.topic}`
-                  : voteTopic
-                  ? `Topic: ${voteTopic}`
-                  : 'No topic selected'}
+                <span>
+                  Ready:{' '}
+                  <b>{voteReadyCount}</b> / <b>{displayVoteSeats || '—'}</b>
+                </span>
+                <span>•</span>
+                <span>
+                  Voted:{' '}
+                  <b>{voteSubmittedCount}</b> / <b>{displayVoteSeats || '—'}</b>
+                </span>
               </div>
             </>
           )}
@@ -1002,17 +1028,7 @@ export default function Room() {
                   Type “done” or “submit” to bump the meter.
                 </span>
               </div>
-
-              <button
-                className="btn primary"
-                onClick={finalize}
-                disabled={finalBusy}
-                style={{ marginLeft: 'auto' }}
-              >
-                {finalBusy
-                  ? 'Finalizing Session…'
-                  : 'Finalize Session'}
-              </button>
+              {/* No manual Finalize button: backend auto-closes at 50% ready */}
             </>
           )}
 
@@ -1037,7 +1053,7 @@ export default function Room() {
       </div>
 
       {/* Voting Modal (Discovery) */}
-      {stage === 'DISCOVERY' && voteOpen && (
+      {stage === 'DISCOVERY' && voteOpen && voteModalOpen && (
         <div
           className="fixed inset-0 z-50"
           style={{
@@ -1088,18 +1104,8 @@ export default function Room() {
                     fontSize: 12,
                   }}
                 >
-                  Pick one number. Your vote is
-                  counted once.
-                  {voteClosesAt
-                    ? ` Closes in ~${Math.max(
-                        0,
-                        Math.floor(
-                          (voteClosesAt.getTime() -
-                            Date.now()) /
-                            1000
-                        )
-                      )}s`
-                    : ''}
+                  Pick one number. Your vote is counted once. Voting will close
+                  automatically when everyone in your room has voted.
                 </div>
               </div>
             </div>
@@ -1196,22 +1202,20 @@ export default function Room() {
                   gap: 8,
                 }}
               >
-                {!isPresenter && (
-                  <button
-                    className="btn"
-                    onClick={() =>
-                      setVoteOpen(false)
-                    }
-                  >
-                    Close
-                  </button>
-                )}
+                <button
+                  className="btn"
+                  onClick={() =>
+                    setVoteModalOpen(false)
+                  }
+                >
+                  Close
+                </button>
                 {isPresenter && (
                   <button
                     className="btn primary"
                     onClick={closeVote}
                   >
-                    Close & Lock Topic
+                    Force Close & Lock Topic
                   </button>
                 )}
               </div>
