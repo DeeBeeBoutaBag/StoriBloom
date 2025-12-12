@@ -218,13 +218,13 @@ async function ensureRoom(roomId) {
     greetedForStage: {},
     seats: [], // track occupancy
 
-    // NEW: voting readiness + submitted tracking
+    // voting readiness + submitted tracking
     voteReadyUids: [],
     voteReadyCount: 0,
     voteSubmittedUids: [],
     voteSubmittedCount: 0,
 
-    // NEW: final-stage tracking
+    // final-stage tracking
     finalReadyUids: [],
     finalReadyCount: 0,
     finalCompletedAt: null,
@@ -430,6 +430,97 @@ async function getBestFinalText(roomId) {
   return '';
 }
 
+// Helper: complete the FINAL stage for a room (closing message + final abstract)
+async function completeFinalSession(room) {
+  const roomId = room.roomId;
+  const stage = room.stage || 'LOBBY';
+
+  // If already closed, just echo back
+  if (stage === 'CLOSED') {
+    const seatsClosed = getSeatCount(room);
+    return {
+      ok: true,
+      closed: true,
+      stage: room.stage,
+      finalCompletedAt: room.finalCompletedAt || Date.now(),
+      readyCount: Number(room.finalReadyCount || 0),
+      seats: seatsClosed,
+      alreadyClosed: true,
+    };
+  }
+
+  if (stage !== 'FINAL') {
+    return {
+      ok: false,
+      reason: 'not_in_final',
+      stage,
+    };
+  }
+
+  const readyCount = Number(room.finalReadyCount || 0);
+  const seats = getSeatCount(room);
+
+  // 🔑 Pull the best final text (EDITING → rough draft → ideaSummary)
+  const finalText = await getBestFinalText(roomId);
+  const hasFinal = !!finalText && finalText.trim().length > 0;
+
+  // 1) Closing ceremony message
+  const closingLines = [];
+  closingLines.push('🏁 **Session complete.** Beautiful work, team.');
+  if (seats > 0) {
+    closingLines.push(
+      `**${readyCount} / ${seats}** teammates clicked **done** — that’s your consensus on this abstract.`
+    );
+  }
+  if (room.topic) {
+    closingLines.push(`You just wrapped a story on **${room.topic}**.`);
+  }
+  closingLines.push(
+    'Screenshot or copy your final abstract below — this is your group’s shared version. Build on it after the workshop.'
+  );
+
+  await addMessage(roomId, {
+    text: closingLines.join(' '),
+    phase: 'FINAL',
+    authorType: 'asema',
+    personaIndex: 0,
+  });
+
+  // 2) Paste the actual final abstract
+  if (hasFinal) {
+    await addMessage(roomId, {
+      text: `**Final Abstract**\n\n${finalText}`,
+      phase: 'FINAL',
+      authorType: 'asema',
+      personaIndex: 0,
+    });
+  } else {
+    await addMessage(roomId, {
+      text:
+        'I couldn’t find a full edited abstract — your chat log is still full of strong lines. Copy what you like and keep writing offline.',
+      phase: 'FINAL',
+      authorType: 'asema',
+      personaIndex: 0,
+    });
+  }
+
+  // 3) Lock + close
+  const finalCompletedAt = Date.now();
+  const updated = await updateRoom(roomId, {
+    stage: 'CLOSED',
+    inputLocked: true,
+    finalCompletedAt,
+  });
+
+  return {
+    ok: true,
+    closed: true,
+    stage: updated.stage,
+    finalCompletedAt,
+    readyCount,
+    seats,
+  };
+}
 
 // ---------- Room Assignment (6 per room, up to 5 rooms) ----------
 async function assignRoomForUser(siteIdRaw, uid) {
@@ -523,7 +614,22 @@ const stageEngine = createStageEngine({
         personaIndex: 0,
       });
 
-      // 2) Special handling for EDITING:
+      // 2) DISCOVERY: one-time room greeting (not per user)
+      if (stage === 'DISCOVERY') {
+        try {
+          const text = await Asema.greet(stage, room.topic || '');
+          await addMessage(room.roomId, {
+            text,
+            phase: stage,
+            authorType: 'asema',
+            personaIndex: 0,
+          });
+        } catch (gerr) {
+          console.error('[stageEngine DISCOVERY greet] error', gerr);
+        }
+      }
+
+      // 3) Special handling for EDITING:
       //    - Re-post the latest rough draft into this stage so people can edit it in context.
       if (stage === 'EDITING') {
         try {
@@ -558,11 +664,7 @@ const stageEngine = createStageEngine({
         }
       }
 
-      // 3) Reset greetedForStage so the /welcome endpoint
-      //    can give a fresh, stage-specific greeting if called.
-      const greeted = { ...(room.greetedForStage || {}) };
-      greeted[stage] = false;
-      await updateRoom(room.roomId, { greetedForStage: greeted });
+      // No greetedForStage reset — greeting is owned by stage transitions, not /welcome.
     } catch (e) {
       console.error('[stageEngine onStageAdvanced] error', e);
     }
@@ -651,7 +753,6 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
     topic: r.topic || '',
     ideaSummary: r.ideaSummary || '',
 
-    // NEW
     seats: getSeatCount(r),
     finalReadyCount: Number(r.finalReadyCount || 0),
     finalCompletedAt: r.finalCompletedAt || null,
@@ -843,7 +944,6 @@ app.get('/rooms/:roomId/vote', requireAuth, async (req, res) => {
     votesReceived,
     counts,
     topic: r.topic || '',
-    // NEW
     voteReadyCount: Number(r.voteReadyCount || 0),
     voteSubmittedCount: Number(r.voteSubmittedCount || 0),
     seats,
@@ -1037,27 +1137,9 @@ function shouldRunAsk(roomId) {
   return true;
 }
 
+// Legacy welcome endpoint (no-op): greeting now handled by stage engine on DISCOVERY
 app.post('/rooms/:roomId/welcome', requireAuth, async (req, res) => {
-  const roomId = req.params.roomId;
-  const r = await ensureRoom(roomId);
-  const stage = r.stage || 'LOBBY';
-  const greeted = r.greetedForStage || {};
-  if (greeted[stage]) return res.json({ ok: true, skipped: true });
-
-  try {
-    const text = await Asema.greet(stage, r.topic || '');
-    await addMessage(roomId, {
-      text,
-      phase: stage,
-      authorType: 'asema',
-    });
-    greeted[stage] = true;
-    await updateRoom(roomId, { greetedForStage: greeted });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[welcome] error', e);
-    res.json({ ok: true, fallback: true });
-  }
+  return res.json({ ok: true, disabled: true });
 });
 
 app.post('/rooms/:roomId/ask', requireAuth, async (req, res) => {
@@ -1138,105 +1220,14 @@ app.post('/rooms/:roomId/final/start', requireAuth, async (_req, res) =>
   res.json({ ok: true })
 );
 
-// Helper to finalize a room (closing ceremony + final abstract)
-async function finalizeRoom(roomId) {
-  const room = await ensureRoom(roomId);
-  const stage = room.stage || 'LOBBY';
-
-  // If already closed, just echo back
-  if (stage === 'CLOSED') {
-    const seatsClosed = getSeatCount(room);
-    return {
-      ok: true,
-      closed: true,
-      stage: room.stage,
-      finalCompletedAt: room.finalCompletedAt || Date.now(),
-      readyCount: Number(room.finalReadyCount || 0),
-      seats: seatsClosed,
-      alreadyClosed: true,
-    };
-  }
-
-  if (stage !== 'FINAL') {
-    return {
-      ok: false,
-      wrongStage: true,
-      stage,
-    };
-  }
-
-  const readyCount = Number(room.finalReadyCount || 0);
-  const seats = getSeatCount(room);
-
-  // 🔑 Pull the best final text (EDITING → rough draft → ideaSummary)
-  const finalText = await getBestFinalText(roomId);
-  const hasFinal = !!finalText && finalText.trim().length > 0;
-
-  // 1) Closing ceremony message
-  const closingLines = [];
-  closingLines.push('🏁 **Session complete.** Beautiful work, team.');
-  if (seats > 0) {
-    closingLines.push(
-      `**${readyCount} / ${seats}** teammates clicked **done** — that’s your consensus on this abstract.`
-    );
-  }
-  if (room.topic) {
-    closingLines.push(`You just wrapped a story on **${room.topic}**.`);
-  }
-  closingLines.push(
-    'Screenshot or copy your final abstract below — this is your group’s shared version. Build on it after the workshop.'
-  );
-
-  await addMessage(roomId, {
-    text: closingLines.join(' '),
-    phase: 'FINAL',
-    authorType: 'asema',
-    personaIndex: 0,
-  });
-
-  // 2) Paste the actual final abstract
-  if (hasFinal) {
-    await addMessage(roomId, {
-      text: `**Final Abstract**\n\n${finalText}`,
-      phase: 'FINAL',
-      authorType: 'asema',
-      personaIndex: 0,
-    });
-  } else {
-    await addMessage(roomId, {
-      text:
-        'I couldn’t find a full edited abstract — your chat log is still full of strong lines. Copy what you like and keep writing offline.',
-      phase: 'FINAL',
-      authorType: 'asema',
-      personaIndex: 0,
-    });
-  }
-
-  // 3) Lock + close
-  const finalCompletedAt = Date.now();
-  const updated = await updateRoom(roomId, {
-    stage: 'CLOSED',
-    inputLocked: true,
-    finalCompletedAt,
-  });
-
-  return {
-    ok: true,
-    closed: true,
-    stage: updated.stage,
-    finalCompletedAt,
-    readyCount,
-    seats,
-  };
-}
-
 app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
 
   try {
-    const result = await finalizeRoom(roomId);
+    const room = await ensureRoom(roomId);
+    const result = await completeFinalSession(room);
 
-    if (result.wrongStage) {
+    if (!result.ok && result.stage && result.stage !== 'CLOSED') {
       return res
         .status(400)
         .json({ error: 'wrong_stage', stage: result.stage });
@@ -1248,7 +1239,6 @@ app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
     return res.status(500).json({ error: 'final_complete_failed' });
   }
 });
-
 
 // Mark a participant as "ready" in FINAL stage (called when they type "done"/"submit")
 app.post('/rooms/:roomId/final/ready', requireAuth, async (req, res) => {
@@ -1271,38 +1261,36 @@ app.post('/rooms/:roomId/final/ready', requireAuth, async (req, res) => {
     readyUids.push(uid);
   }
 
-  const seats = getSeatCount(r);
-  const finalReadyCount = readyUids.length;
-
   const updated = await updateRoom(roomId, {
     finalReadyUids: readyUids,
-    finalReadyCount,
+    finalReadyCount: readyUids.length,
   });
 
-  const threshold = seats > 0 ? Math.ceil(seats * 0.5) : 0;
+  const seats = getSeatCount(updated);
+  const readyCount = updated.finalReadyCount || 0;
 
-  // If at least half the room has typed "done", auto-finalize the session
-  if (threshold > 0 && finalReadyCount >= threshold) {
+  let autoClosed = false;
+  let finalResult = null;
+
+  // NEW: only close once *everyone* is done
+  if (seats > 0 && readyCount >= seats) {
     try {
-      const result = await finalizeRoom(roomId);
-      return res.json({
-        ok: true,
-        autoClosed: true,
-        ...result,
-      });
+      finalResult = await completeFinalSession(updated);
+      autoClosed = !!finalResult.ok;
     } catch (e) {
-      console.error('[final/ready] auto finalize error', e);
-      // fall through and at least return ready counts
+      console.error('[final/ready] auto-complete error', e);
     }
   }
 
   return res.json({
     ok: true,
-    readyCount: updated.finalReadyCount || 0,
+    readyCount,
     seats,
+    autoClosed,
+    stage: autoClosed ? 'CLOSED' : stage,
+    ...(finalResult && finalResult.ok ? { finalCompletedAt: finalResult.finalCompletedAt } : {}),
   });
 });
-
 
 // ---------- Codes: consume ----------
 app.post('/codes/consume', requireAuth, async (req, res) => {

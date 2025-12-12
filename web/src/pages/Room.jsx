@@ -45,7 +45,8 @@ const STAGE_DESCRIPTIONS = {
   PLANNING: 'Group chooses a focus and rough structure.',
   ROUGH_DRAFT: 'Asema drafts a first version from your ideas.',
   EDITING: 'Team revises, sharpens, and corrects the draft.',
-  FINAL: 'Final touches and “we’re done” check-in.',
+  FINAL:
+    'Final touches and “we’re done” check-in. Session wraps when everyone types “done” or “submit”.',
   CLOSED: 'Session is complete, scroll and copy your abstract.',
 };
 
@@ -143,7 +144,7 @@ export default function Room() {
   const [sentWelcome, setSentWelcome] = useState(false);
 
   // Voting (frontend glue; backend handles real logic)
-  const [voteOpen, setVoteOpen] = useState(false);          // backend: votingOpen
+  const [voteOpen, setVoteOpen] = useState(false); // backend: votingOpen
   const [voteModalOpen, setVoteModalOpen] = useState(false); // local: modal visibility
   const [voteOptions, setVoteOptions] = useState([]);
   const [hasVoted, setHasVoted] = useState(false);
@@ -1025,10 +1026,11 @@ export default function Room() {
                   />
                 </div>
                 <span style={{ fontSize: 11, opacity: 0.8 }}>
-                  Type “done” or “submit” to bump the meter.
+                  Type “done” or “submit” to bump the meter — session closes when everyone is
+                  ready.
                 </span>
               </div>
-              {/* No manual Finalize button: backend auto-closes at 50% ready */}
+              {/* No manual Finalize button: backend auto-closes when everyone is ready */}
             </>
           )}
 
