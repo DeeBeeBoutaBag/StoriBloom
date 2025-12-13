@@ -36,24 +36,53 @@ function useSiteIdFromUrl() {
   return [siteId, setSiteId];
 }
 
-/**
- * Merge authHeaders() with presenter role header.
- * This is the key fix so server.js isPresenterReq(req) passes.
- */
+// Merge authHeaders() with presenter role header (fixes presenter_only)
 async function presenterAuthHeaders() {
   const base = await authHeaders();
-
-  // authHeaders() should return { headers, credentials, ... }
-  // We merge headers safely.
   const mergedHeaders = {
     ...(base.headers || {}),
     'x-user-role': 'PRESENTER',
   };
-
   return {
     ...base,
     headers: mergedHeaders,
   };
+}
+
+function formatClosedAt(ms) {
+  const n = Number(ms || 0);
+  if (!n) return '';
+  try {
+    return new Date(n).toLocaleString();
+  } catch {
+    return '';
+  }
+}
+
+async function copyToClipboard(text) {
+  const t = String(text || '');
+  if (!t) return false;
+
+  try {
+    await navigator.clipboard.writeText(t);
+    return true;
+  } catch {
+    // fallback
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = t;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.top = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
 }
 
 export default function Presenter() {
@@ -62,12 +91,18 @@ export default function Presenter() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  // Gallery state
+  const [galleryOpen, setGalleryOpen] = useState(false);
+  const [galleryLoading, setGalleryLoading] = useState(false);
+  const [galleryError, setGalleryError] = useState('');
+  const [galleryItems, setGalleryItems] = useState([]);
+  const [galleryCopiedRoom, setGalleryCopiedRoom] = useState('');
+
   const canFetch = useMemo(() => !!(siteId && siteId.trim().length), [siteId]);
 
   // ── Auth bootstrap ──────────────────────────────────────────────────────
   useEffect(() => {
     ensureGuest().catch((e) => console.warn('[Presenter] ensureGuest failed', e));
-    // Ensure role is PRESENTER for this view (helps other parts of UI that read sessionStorage)
     try {
       sessionStorage.setItem('role', 'PRESENTER');
     } catch {}
@@ -113,10 +148,9 @@ export default function Presenter() {
   // ── Simple POST helper for controls ─────────────────────────────────────
   async function post(path, body) {
     try {
-      const headers = await presenterAuthHeaders();
       const res = await fetch(`${API_BASE}${path}`, {
         method: 'POST',
-        ...headers,
+        ...(await presenterAuthHeaders()),
         body: body ? JSON.stringify(body) : undefined,
       });
       if (!res.ok) {
@@ -143,6 +177,60 @@ export default function Presenter() {
   // NEW: close FINAL room from presenter dashboard
   const closeFinal = (roomId) => post(`/rooms/${roomId}/final/close`);
 
+  // ── Gallery fetch ───────────────────────────────────────────────────────
+  const loadGallery = useCallback(async () => {
+    if (!canFetch) return;
+    setGalleryLoading(true);
+    setGalleryError('');
+    setGalleryCopiedRoom('');
+    try {
+      const url = new URL(`${API_BASE}/presenter/gallery`, window.location.origin);
+      url.searchParams.set('siteId', siteId.toUpperCase());
+
+      const res = await fetch(url.toString(), {
+        ...(await presenterAuthHeaders()),
+      });
+
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.error || `gallery fetch failed (${res.status})`);
+      }
+
+      const j = await res.json();
+      const items = Array.isArray(j.items) ? j.items : [];
+
+      // Normalize so UI always has: roomId, topic, abstract, closedAt
+      const normalized = items
+        .map((it) => ({
+          siteId: (it.siteId || siteId || '').toUpperCase(),
+          roomId: it.roomId || it.id || '',
+          index: Number(it.index || 0) || null,
+          topic: it.topic || '',
+          abstract: it.abstract || it.finalAbstract || '',
+          closedAt: it.closedAt || it.finalCompletedAt || null,
+          closedBy: it.closedBy || '',
+        }))
+        .filter((it) => it.roomId);
+
+      // Sort newest first
+      normalized.sort((a, b) => Number(b.closedAt || 0) - Number(a.closedAt || 0));
+
+      setGalleryItems(normalized);
+    } catch (err) {
+      console.error('[Presenter] gallery load error:', err);
+      setGalleryItems([]);
+      setGalleryError(err.message || 'Could not load gallery.');
+    } finally {
+      setGalleryLoading(false);
+    }
+  }, [siteId, canFetch]);
+
+  // When opening the modal, load immediately
+  useEffect(() => {
+    if (!galleryOpen) return;
+    loadGallery();
+  }, [galleryOpen, loadGallery]);
+
   // ── Derived summary for header ──────────────────────────────────────────
   const stageSummary = useMemo(() => {
     const byStage = {};
@@ -164,16 +252,6 @@ export default function Presenter() {
     () => [...rooms].sort((a, b) => (a.index || 0) - (b.index || 0)),
     [rooms]
   );
-
-  function formatClosedAt(ms) {
-    const n = Number(ms || 0);
-    if (!n) return '';
-    try {
-      return new Date(n).toLocaleString();
-    } catch {
-      return '';
-    }
-  }
 
   return (
     <>
@@ -213,6 +291,18 @@ export default function Presenter() {
             </div>
             <div>
               Participants: <b>{estimatedSeats}</b>
+            </div>
+
+            {/* NEW: Gallery button */}
+            <div style={{ marginTop: 8 }}>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setGalleryOpen(true)}
+                disabled={!canFetch}
+              >
+                📚 Gallery
+              </button>
             </div>
           </div>
         </header>
@@ -279,8 +369,6 @@ export default function Presenter() {
                   <div className="room-card-topic">
                     <span className="label">Topic</span> {r.topic || '—'}
                   </div>
-
-                  {/* NEW (light touch): draft + closure metadata */}
                   <div>
                     <span className="label">Draft</span>{' '}
                     {Number(r.draftVersion || 0) ? `v${Number(r.draftVersion || 0)}` : '—'}
@@ -344,7 +432,6 @@ export default function Presenter() {
                       Close &amp; Lock Topic
                     </button>
 
-                    {/* NEW: presenter close FINAL (only enabled in FINAL) */}
                     <button
                       type="button"
                       onClick={() => closeFinal(r.id)}
@@ -366,7 +453,6 @@ export default function Presenter() {
                   </div>
                 </section>
 
-                {/* Optional inline presenter voting panel */}
                 <section className="room-card-voting-panel">
                   <PresenterVotingPanel roomId={r.id} isPresenter />
                 </section>
@@ -375,6 +461,184 @@ export default function Presenter() {
           })}
         </main>
       </div>
+
+      {/* Gallery Modal */}
+      {galleryOpen && (
+        <div
+          className="fixed inset-0 z-50"
+          style={{
+            background: 'rgba(0,0,0,0.55)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 16,
+          }}
+          onClick={() => setGalleryOpen(false)}
+        >
+          <div
+            className="rounded-2xl"
+            style={{
+              width: 960,
+              maxWidth: '96vw',
+              maxHeight: '90vh',
+              overflow: 'hidden',
+              background: 'rgba(20,20,24,0.6)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              backdropFilter: 'blur(10px)',
+              boxShadow: '0 16px 48px rgba(0,0,0,0.45)',
+              color: 'white',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div
+              style={{
+                padding: 16,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                borderBottom: '1px solid rgba(255,255,255,0.08)',
+                gap: 12,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div className="gold-dot" />
+                <div>
+                  <div style={{ fontWeight: 800, fontSize: 18 }}>
+                    Gallery — {siteId || '—'}
+                  </div>
+                  <div style={{ opacity: 0.75, fontSize: 12 }}>
+                    Closed room abstracts (newest first). Copy, share, export.
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={loadGallery}
+                  disabled={galleryLoading}
+                >
+                  {galleryLoading ? 'Refreshing…' : 'Refresh'}
+                </button>
+                <button
+                  type="button"
+                  className="btn primary"
+                  onClick={() => setGalleryOpen(false)}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+
+            {/* Body */}
+            <div style={{ padding: 16, overflowY: 'auto', maxHeight: 'calc(90vh - 70px)' }}>
+              {galleryError && (
+                <div className="presenter-empty glass" style={{ marginBottom: 12 }}>
+                  {galleryError}
+                </div>
+              )}
+
+              {!galleryError && galleryLoading && (
+                <div className="presenter-empty glass" style={{ marginBottom: 12 }}>
+                  Loading gallery…
+                </div>
+              )}
+
+              {!galleryError && !galleryLoading && galleryItems.length === 0 && (
+                <div className="presenter-empty glass">
+                  No closed abstracts yet for <b>{siteId}</b>. Close rooms in FINAL to populate.
+                </div>
+              )}
+
+              {!galleryError && !galleryLoading && galleryItems.length > 0 && (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12 }}>
+                  {galleryItems.map((it) => (
+                    <div
+                      key={it.roomId}
+                      className="glass"
+                      style={{
+                        borderRadius: 16,
+                        padding: 14,
+                        border: '1px solid rgba(255,255,255,0.10)',
+                        background: 'rgba(15,23,42,0.65)',
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'flex-start',
+                          justifyContent: 'space-between',
+                          gap: 12,
+                          marginBottom: 8,
+                        }}
+                      >
+                        <div>
+                          <div style={{ fontWeight: 800, fontSize: 14 }}>
+                            {it.roomId}{it.index ? ` (Room ${it.index})` : ''}{' '}
+                            <span style={{ opacity: 0.65, fontWeight: 600 }}>
+                              • {formatClosedAt(it.closedAt) || '—'}
+                            </span>
+                          </div>
+                          <div style={{ opacity: 0.9, fontSize: 13, marginTop: 2 }}>
+                            <span style={{ opacity: 0.7 }}>Topic:</span>{' '}
+                            <b>{it.topic || '—'}</b>
+                          </div>
+                        </div>
+
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                          <button
+                            type="button"
+                            className="btn"
+                            onClick={async () => {
+                              const ok = await copyToClipboard(it.abstract || '');
+                              setGalleryCopiedRoom(ok ? it.roomId : '');
+                              if (!ok) alert('Copy failed — your browser blocked clipboard.');
+                              if (ok) {
+                                setTimeout(() => setGalleryCopiedRoom(''), 1200);
+                              }
+                            }}
+                            disabled={!it.abstract}
+                            title="Copy abstract to clipboard"
+                          >
+                            {galleryCopiedRoom === it.roomId ? '✅ Copied' : 'Copy'}
+                          </button>
+
+                          <a
+                            href={`/room/${it.roomId}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="btn"
+                            style={{ textDecoration: 'none' }}
+                            title="Open room view"
+                          >
+                            Open
+                          </a>
+                        </div>
+                      </div>
+
+                      <div
+                        style={{
+                          whiteSpace: 'pre-wrap',
+                          fontSize: 13,
+                          lineHeight: 1.45,
+                          padding: 10,
+                          borderRadius: 12,
+                          background: 'rgba(0,0,0,0.25)',
+                          border: '1px solid rgba(255,255,255,0.08)',
+                        }}
+                      >
+                        {it.abstract ? it.abstract : '— No abstract text —'}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       <PresenterHUD siteId={siteId} rooms={sortedRooms} />
     </>
