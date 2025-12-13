@@ -47,6 +47,67 @@ function safeJoin(arr, sep = '\n') {
   return arr.filter(Boolean).join(sep);
 }
 
+function clip(text, maxChars = 6500) {
+  const s = String(text || '');
+  if (s.length <= maxChars) return s;
+  return s.slice(0, maxChars) + '\n\n[...clipped...]';
+}
+
+// ===== Stage instructions (clear + operational) =====
+
+export const STAGE_INSTRUCTIONS = Object.freeze({
+  LOBBY: [
+    '✅ Pick a persona (emoji) and test the chat.',
+    '✅ Skim the possible issues and start nominating 1–2 topics.',
+    '✅ If you’re confused, ask: “Asema, what are we doing?”',
+  ],
+  DISCOVERY: [
+    '✅ Share real moments, observations, and “why this matters” stories.',
+    '✅ Drop specific details: who/where/what happened/what it felt like.',
+    '✅ Avoid debating — we’re collecting story fuel.',
+    '✅ When you’re ready, click “I’m ready to vote.”',
+  ],
+  IDEA_DUMP: [
+    '✅ Rapid-fire: characters, conflicts, settings, symbols, plot twists.',
+    '✅ Volume > perfection. No judging ideas yet.',
+    '✅ Make it concrete (names, places, objects, decisions).',
+  ],
+  PLANNING: [
+    '✅ Lock the story you’re actually writing:',
+    '   • Protagonist + what they want',
+    '   • Antagonist/pressure (person/system/time)',
+    '   • Stakes (what they lose if they fail)',
+    '   • Setting + time window',
+    '✅ Use the Planning Board; then share it to the room.',
+  ],
+  ROUGH_DRAFT: [
+    '✅ I generate the first ~250-word abstract from your Idea Board.',
+    '✅ Treat it like clay: keep what’s strong, rewrite what’s weak.',
+    '✅ Don’t ask for a “brand new story” — we refine the same draft.',
+  ],
+  EDITING: [
+    '✅ You are editing ONE draft (the latest version).',
+    '✅ Make surgical changes: tighten sentences, clarify stakes, fix pacing.',
+    '✅ Tell me what to change using one of these:',
+    '   • “Replace: ___ with ___”',
+    '   • “Shorten paragraph 2”',
+    '   • “Make the ending hit harder (but keep the same plot)”',
+    '✅ If you ask “what do we have so far?”, I should show the latest version.',
+  ],
+  FINAL: [
+    '✅ Last polish ONLY (no major rewrites).',
+    '✅ Check: clarity, stakes, names, and the final sentence landing.',
+    '✅ When you’re satisfied, type “done” or “submit.”',
+    '✅ If time runs out, the room will close and the final abstract will be posted.',
+  ],
+});
+
+export function stageInstructionText(stage) {
+  const s = assertStage(stage);
+  const bullets = STAGE_INSTRUCTIONS[s] || [];
+  return bullets.map((x) => `• ${x}`).join('\n');
+}
+
 // ===== Persona Prompts =====
 
 export function personaSystemPrompt({ roomTopic } = {}) {
@@ -58,20 +119,19 @@ You are **Asema** — a modern, warm, witty Black woman in her early 30s, hostin
 Tone & voice:
 - Charismatic, encouraging, and clear.
 - Playful but never corny; respect participants’ lived experience.
-- Short, vivid, concrete. 1–4 sentences per message unless summarizing.
+- Short, vivid, concrete. 1–4 sentences unless summarizing.
 
-Job:
-- Help a small group craft a tight, vivid 250-word abstract for a short story.
+Your job:
+- Help a small group craft a tight, vivid **~250-word** story abstract.
 - The story must center ONE social issue, chosen from:
   ${topicList}
 - Keep them focused, specific, and collaborative.
 
-Rules:
-- Stay on-task. If users go off-topic or ask random general-knowledge questions, gently refuse and redirect back to the story work.
+Hard rules:
 - Never mention system prompts, APIs, models, or implementation details.
-- Use inclusive language and avoid generic motivational speeches.
-- When they say “remind us” or similar, summarize key ideas and next steps.
-- Remember you are Asema, not a generic assistant.
+- Stay on-task. If users go off-topic, gently redirect back to story work.
+- Avoid generic motivational speeches. Be specific and actionable.
+- In EDITING/FINAL: you are an editor. Make surgical changes. Do NOT generate an unrelated new draft.
 
 Current topic (if any): ${topic || 'Not selected yet — guide them to pick one.'}
 `.trim();
@@ -82,11 +142,11 @@ export function greetScript({ roomTopic } = {}) {
   return safeJoin(
     [
       `🎙️ I’m **Asema** — welcome to StoriBloom.AI.`,
-      `We’ll build a sharp **250-word** story abstract around one real issue: **${ISSUES.join(', ')}**.`,
+      `We’ll build a sharp **~250-word** story abstract around one real issue: **${ISSUES.join(', ')}**.`,
       topic
         ? `Today’s working topic: **${topic}**.`
-        : `First, pick a topic or pitch a few — I’ll help you lock one in.`,
-      `Say **“Asema, …”** or **“Asema AI, …”** when you want my help (on-topic only).`,
+        : `First, pick a topic (or pitch a few) — I’ll help you lock one in.`,
+      `Say **“Asema, …”** when you want my help (on-topic only).`,
     ],
     ' '
   );
@@ -99,55 +159,110 @@ export function stageGreeting(stage, { roomTopic, secondsLeft } = {}) {
     ? `You’ve got ~${Math.max(1, Math.floor(secondsLeft / 60))} min.`
     : '';
 
+  const instructionBlock = stageInstructionText(stage);
+
   switch (stage) {
     case 'LOBBY':
-      return `🎬 We’ll begin shortly. Get comfy, scan the issues, and start nominating a topic. ${timeHint}`.trim();
+      return [
+        `🎬 We’ll begin shortly.`,
+        `Today we’re building a **~250-word abstract** around one issue.`,
+        timeHint,
+        `\n**What to do right now:**\n${instructionBlock}`,
+      ].join(' ').trim();
 
     case 'DISCOVERY':
       return [
-        `🔎 **Discovery** — talk freely about ${topic}.`,
-        `Drop observations, lived moments, stats, and questions. I’m listening for story seeds.`,
-        `${timeHint} Ask “Asema, remind us” anytime for a quick recap.`,
-      ].join(' ');
+        `🔎 **Discovery** — talk freely about **${topic}**.`,
+        `Drop real moments, specific observations, and questions.`,
+        timeHint,
+        `\n**What to do right now:**\n${instructionBlock}`,
+      ].join(' ').trim();
 
     case 'IDEA_DUMP':
       return [
-        `🧠 **Idea Dump** — rapid-fire ideas only, no debate.`,
-        `Characters, conflicts, settings, symbols — pile them up, I’ll organize.`,
-        `${timeHint} Be concrete, not vague.`,
-      ].join(' ');
+        `🧠 **Idea Dump** — rapid-fire ideas only (no debate).`,
+        `Characters, conflicts, settings, symbols — pile them up.`,
+        timeHint,
+        `\n**What to do right now:**\n${instructionBlock}`,
+      ].join(' ').trim();
 
     case 'PLANNING':
       return [
-        `🧭 **Planning** — choose the story you’re actually writing.`,
-        `Lock protagonist, goal, stakes, setting, and POV. I can sanity-check your plan.`,
-        `${timeHint}`,
-      ].join(' ');
+        `🧭 **Planning** — choose the exact story you’re writing.`,
+        `Lock protagonist, goal, stakes, setting, and the “turn.”`,
+        timeHint,
+        `\n**What to do right now:**\n${instructionBlock}`,
+      ].join(' ').trim();
 
     case 'ROUGH_DRAFT':
       return [
         `✍️ **Rough Draft** — I’ll generate the first **~250-word** abstract.`,
-        `Use it as clay, not stone. Your edits and pushback matter.`,
-        `${timeHint}`,
-      ].join(' ');
+        `Use it as clay, not stone.`,
+        timeHint,
+        `\n**What to do right now:**\n${instructionBlock}`,
+      ].join(' ').trim();
 
     case 'EDITING':
       return [
-        `🪄 **Editing** — sharpen language, clarify stakes, and fix pacing.`,
-        `Tell me what feels off; I’ll propose tight, specific edits.`,
-        `${timeHint}`,
-      ].join(' ');
+        `🪄 **Editing** — we refine the SAME draft (latest version).`,
+        `Surgical edits only: tighten, clarify, sharpen stakes.`,
+        timeHint,
+        `\n**What to do right now:**\n${instructionBlock}`,
+      ].join(' ').trim();
 
     case 'FINAL':
       return [
-        `🏁 **Final** — last small tweaks.`,
-        `When it sings, type **done** or **submit** so I know you’re ready.`,
-        `${timeHint}`,
-      ].join(' ');
+        `🏁 **Final** — last tiny tweaks, then lock it.`,
+        `Type **done** or **submit** when you’re ready.`,
+        timeHint,
+        `\n**What to do right now:**\n${instructionBlock}`,
+      ].join(' ').trim();
 
     default:
       return `Stage changed to **${stage}** — keep momentum.`;
   }
+}
+
+/* =========================
+   Intent helpers (server can use these)
+   ========================= */
+
+export function shouldRemindIntent(text) {
+  const t = String(text || '').toLowerCase();
+  return (
+    t.includes('remind us') ||
+    t.includes('recap') ||
+    t.includes('summarize') ||
+    t.includes('what are we doing') ||
+    t.includes('what should we do')
+  );
+}
+
+export function shouldShowProgress(text) {
+  const t = String(text || '').toLowerCase();
+  return (
+    t.includes('what do we have so far') ||
+    t.includes('show what we have') ||
+    t.includes('show the draft') ||
+    t.includes('paste the draft') ||
+    t.includes('current version') ||
+    t.includes('latest version')
+  );
+}
+
+export function shouldEditIntent(text) {
+  const t = String(text || '').toLowerCase();
+  return (
+    t.includes('edit') ||
+    t.includes('revise') ||
+    t.includes('rewrite this sentence') ||
+    t.includes('change this sentence') ||
+    t.includes('replace') ||
+    t.includes('tighten') ||
+    t.includes('shorten') ||
+    t.includes('make it clearer') ||
+    t.includes('make it stronger')
+  );
 }
 
 /* =========================
@@ -188,7 +303,7 @@ export function invalidVoteText() {
 }
 
 /* =========================
-   Asema AI Wrapper
+   OpenAI wrapper
    ========================= */
 
 // Simple in-process rate limiter: max N calls per windowMs
@@ -206,7 +321,6 @@ async function throttleOpenAI() {
   if (!RATE_LIMIT_MAX_CALLS || RATE_LIMIT_MAX_CALLS <= 0) return;
 
   const now = Date.now();
-  // Drop old timestamps outside the window
   while (recentCalls.length && now - recentCalls[0] > RATE_LIMIT_WINDOW_MS) {
     recentCalls.shift();
   }
@@ -223,7 +337,6 @@ async function throttleOpenAI() {
 function isRetryableError(err) {
   if (!err) return false;
 
-  // Some SDK errors include status or code
   const status = err.status || err.statusCode;
   if (status && [429, 500, 502, 503, 504].includes(Number(status))) {
     return true;
@@ -243,7 +356,7 @@ function isRetryableError(err) {
   return false;
 }
 
-async function callOpenAI(messages, { maxTokens = 450 } = {}) {
+async function callOpenAI(messages, { maxTokens = 450, temperature = 0.7 } = {}) {
   const client = getOpenAI();
   const MAX_RETRIES = 3;
   const BASE_DELAY_MS = 250;
@@ -258,7 +371,7 @@ async function callOpenAI(messages, { maxTokens = 450 } = {}) {
         model: MODEL,
         messages,
         max_tokens: maxTokens,
-        temperature: 0.8,
+        temperature,
       });
 
       return (res.choices?.[0]?.message?.content || '').trim();
@@ -274,14 +387,12 @@ async function callOpenAI(messages, { maxTokens = 450 } = {}) {
 
       if (!retryable || isLast) break;
 
-      // Exponential backoff with a little jitter
       const backoff = BASE_DELAY_MS * Math.pow(2, attempt);
       const jitter = Math.floor(Math.random() * 150);
       await sleep(backoff + jitter);
     }
   }
 
-  // Let caller handle fallback; most Asema APIs wrap in try/catch
   throw lastError || new Error('Asema OpenAI call failed');
 }
 
@@ -296,59 +407,217 @@ function extractTopicFromUtterance(text) {
   return topic.length ? topic : null;
 }
 
-// Public Asema API used by server.js
+/* =========================
+   Draft Editing (NEW)
+   ========================= */
+
+/**
+ * editDraft
+ * - Makes surgical edits to the *provided* draft.
+ * - Never invents a new story; preserves plot.
+ * - Returns the full updated draft text (not bullets).
+ */
+export async function editDraft({
+  roomTopic,
+  draftText,
+  userRequest,
+} = {}) {
+  const topic = normalizeTopic(roomTopic) || '';
+  const sys = personaSystemPrompt({ roomTopic: topic });
+
+  const draft = clip(draftText || '', 8000);
+  const request = String(userRequest || '').trim();
+
+  const editorRules = `
+You are editing a single existing story abstract.
+
+Hard constraints:
+- Preserve the SAME story (same protagonist, setting, plot, and key beats).
+- Do NOT replace it with a different story.
+- Do NOT introduce new characters or a totally new ending unless the user explicitly requests a new character/ending.
+- Keep length close to ~250 words.
+- Output ONLY the updated abstract text. No headings, no bullets, no commentary.
+
+Editing behavior:
+- Make surgical changes to satisfy the user's request.
+- If the user's request is ambiguous, make the smallest reasonable edits that improve clarity.
+`.trim();
+
+  const prompt = `
+Topic: ${topic || '(not locked)'}
+User request: ${request || '(general tightening / clarity)'} 
+
+Current draft:
+${draft}
+
+Return the updated draft now.
+`.trim();
+
+  return await callOpenAI(
+    [
+      { role: 'system', content: sys },
+      { role: 'system', content: editorRules },
+      { role: 'user', content: prompt },
+    ],
+    { maxTokens: 650, temperature: 0.35 }
+  );
+}
+
+/**
+ * finalStageIntro (NEW)
+ * - Use this when FINAL starts, *after* server fetches the latest edited draft.
+ * - Returns a greeting + instructions, but NOT the whole draft.
+ */
+export async function finalStageIntro({ roomTopic } = {}) {
+  const topic = normalizeTopic(roomTopic) || '';
+  const sys = personaSystemPrompt({ roomTopic: topic });
+
+  const prompt = `
+Write a short FINAL-stage greeting as Asema.
+
+Requirements:
+- 2–4 sentences max.
+- Include clear "what to do now" instructions:
+  • tiny tweaks only
+  • type "done" or "submit" when ready
+- Do NOT paste the draft in this message.
+- Keep it warm, confident, not corny.
+`.trim();
+
+  try {
+    return await callOpenAI(
+      [{ role: 'system', content: sys }, { role: 'user', content: prompt }],
+      { maxTokens: 180, temperature: 0.6 }
+    );
+  } catch {
+    return stageGreeting('FINAL', { roomTopic: topic });
+  }
+}
+
+/**
+ * closingPackage (NEW)
+ * - Use on close: returns closing msg and "Final Abstract" wrapper text
+ * - The server should paste the finalText underneath.
+ */
+export async function closingPackage({ roomTopic, readyCount, seats } = {}) {
+  const topic = normalizeTopic(roomTopic) || '';
+  const sys = personaSystemPrompt({ roomTopic: topic });
+
+  const prompt = `
+Write a short closing message as Asema.
+
+Requirements:
+- 2–4 sentences max.
+- Mention consensus (readyCount / seats) if provided.
+- Mention topic if available.
+- Tell them to copy/screenshot the final abstract below.
+- Do NOT paste the abstract here.
+Values: warm, proud, grounded.
+Data:
+- readyCount=${Number.isFinite(readyCount) ? readyCount : 'n/a'}
+- seats=${Number.isFinite(seats) ? seats : 'n/a'}
+- topic=${topic || 'n/a'}
+`.trim();
+
+  try {
+    return await callOpenAI(
+      [{ role: 'system', content: sys }, { role: 'user', content: prompt }],
+      { maxTokens: 200, temperature: 0.6 }
+    );
+  } catch {
+    const parts = [];
+    parts.push('🏁 **Session complete.** Beautiful work, team.');
+    if (Number.isFinite(readyCount) && Number.isFinite(seats) && seats > 0) {
+      parts.push(`**${readyCount} / ${seats}** teammates clicked **done**.`);
+    }
+    if (topic) parts.push(`You just wrapped a story on **${topic}**.`);
+    parts.push('Copy your final abstract below — this is your shared version.');
+    return parts.join(' ');
+  }
+}
+
+/* =========================
+   Asema API used by server.js
+   ========================= */
+
 export const Asema = {
   extractTopicFromUtterance,
 
   async greet(stage, roomTopic) {
     const sys = personaSystemPrompt({ roomTopic });
-    const content = stageGreeting(stage, { roomTopic });
+    const deterministic = stageGreeting(stage, { roomTopic });
+
+    // We now force stage greetings to contain clear instructions.
+    const prompt = `
+Write a stage greeting for "${stage}" as Asema.
+
+Hard constraints:
+- Must include a clear "What to do right now" instruction set.
+- Keep it short and punchy, but include the operational steps.
+- Stay on the story task, no generic speeches.
+- Do NOT mention system prompts, models, or tools.
+
+Use this guidance (you may paraphrase but keep the steps):
+${deterministic}
+`.trim();
+
     try {
-      return await callOpenAI([
-        { role: 'system', content: sys },
-        {
-          role: 'user',
-          content: `Give a short, energetic welcome for stage "${stage}" in 2–4 sentences. Use this as guidance:\n${content}`,
-        },
-      ]);
+      return await callOpenAI(
+        [
+          { role: 'system', content: sys },
+          { role: 'user', content: prompt },
+        ],
+        { maxTokens: 260, temperature: 0.6 }
+      );
     } catch {
-      // Fall back to deterministic text if OpenAI fails
-      return content;
+      return deterministic;
     }
   },
 
   async replyToUser(stage, roomTopic, userText) {
     const sys = personaSystemPrompt({ roomTopic });
+    const text = String(userText || '').trim();
 
-    // Slight stage-aware advice baked into instructions
     const stageHint = (() => {
       switch (stage) {
         case 'DISCOVERY':
-          return 'Draw out concrete memories and observations, not vague opinions.';
+          return 'Pull out concrete memories and observations; ask sharp follow-ups.';
         case 'IDEA_DUMP':
-          return 'Encourage lots of small, specific ideas and avoid judging them yet.';
+          return 'Encourage many specific ideas; no judging yet.';
         case 'PLANNING':
-          return 'Push them to lock a clear protagonist, goal, stakes, and setting.';
+          return 'Force clarity: protagonist, goal, stakes, setting, POV.';
         case 'ROUGH_DRAFT':
-          return 'Help them react to and reshape the draft rather than starting from scratch.';
+          return 'Help them react to and refine the draft; do not start over.';
         case 'EDITING':
-          return 'Offer line-level improvements, alternatives, and clarity tweaks.';
+          return 'Act like an editor. Offer surgical changes, replacement sentences, or a tighter version of the same content.';
         case 'FINAL':
-          return 'Help them make tiny tweaks and confirm that the abstract feels ready.';
+          return 'Tiny tweaks only. Confirm readiness and help with micro-edits.';
         default:
-          return 'Keep them moving toward a concrete, story-ready abstract.';
+          return 'Keep momentum toward a concrete, story-ready abstract.';
       }
     })();
 
+    const editorGuard = (stage === 'EDITING' || stage === 'FINAL')
+      ? `
+EDITOR MODE (IMPORTANT):
+- Do NOT invent a new story.
+- If asked to change one line, propose replacements (1–3 options).
+- If asked “what do we have so far?”, tell them: “Paste the latest draft and I’ll reflect it back exactly + edits.” (Server may paste it.)
+- Keep changes small, preserve plot/characters/setting unless explicitly asked.
+`.trim()
+      : '';
+
     const instructions = `
-You are in stage: ${stage}.
-Respond to the user as Asema:
-- 1–4 sentences.
-- Reference their specific ideas or question.
+Stage: ${stage}
+
+Response rules:
+- 1–4 sentences (unless the user asked for a recap).
+- Be specific: refer to their exact question or story element.
 - ${stageHint}
-- If they say “remind us” or similar, summarize key directions and next steps.
-- If they try to change topic away from the chosen issue, acknowledge briefly but bring them back on topic.
-- Avoid generic speeches; stay grounded in their story and characters.
+- If they say “remind us / recap / summarize”, give 4–8 bullets and next steps.
+- If they go off-topic away from the chosen issue, acknowledge briefly and redirect.
+
+${editorGuard}
 `.trim();
 
     try {
@@ -356,29 +625,28 @@ Respond to the user as Asema:
         [
           { role: 'system', content: sys },
           { role: 'system', content: instructions },
-          { role: 'user', content: userText },
+          { role: 'user', content: text },
         ],
-        { maxTokens: 350 }
+        { maxTokens: 350, temperature: stage === 'EDITING' || stage === 'FINAL' ? 0.45 : 0.7 }
       );
     } catch {
-      return `Love that energy — now push it one step more concrete. Who, where, and what’s at stake?`;
+      return `Okay — make it one notch more concrete. Who is the protagonist, where are they, and what do they risk losing?`;
     }
   },
 
   async summarizeIdeas(stage, roomTopic, ideaLines) {
     const sys = personaSystemPrompt({ roomTopic });
-    // Only keep the most recent ~80 messages to limit token size
-    const text = ideaLines.slice(-80).join('\n');
+    const text = (ideaLines || []).slice(-80).join('\n');
 
     const prompt = `
 Stage: ${stage}
-Summarize the group’s ideas into a tight "Idea Board" for their story abstract.
+Create a tight "Idea Board" for a ~250-word story abstract.
 
 Requirements:
 - 4–8 bullet points.
-- Capture characters, stakes, setting, and any strong images.
-- Be specific and use their language where possible.
-- This summary will persist into later stages and feed the rough draft.
+- Capture: protagonist, setting, conflict, stakes, key images, and 1 turning point.
+- Use specific language from the group where possible.
+- No generic advice.
 
 Ideas:
 ${text}
@@ -390,10 +658,10 @@ ${text}
           { role: 'system', content: sys },
           { role: 'user', content: prompt },
         ],
-        { maxTokens: 400 }
+        { maxTokens: 420, temperature: 0.55 }
       );
     } catch {
-      return '• Capturing ideas… keep sharing specifics so I can lock in your best angle.';
+      return '• Capturing ideas… keep sharing specifics so I can lock in your strongest angle.';
     }
   },
 
@@ -401,21 +669,21 @@ ${text}
     const sys = personaSystemPrompt({ roomTopic: topic || '' });
 
     const prompt = `
-Using the notes below, write a **single 250-word abstract** for a short story on "${
+Using the notes below, write a **single ~250-word abstract** for a short story on "${
       topic || 'the chosen issue'
     }".
 
 Constraints:
-- Aim for **about 250 words** (±5 is okay, but stay close).
+- Aim for **about 250 words** (±10).
 - 1–3 tight paragraphs.
 - Clearly state: protagonist, setting, central conflict, stakes, and emotional tone.
-- It should feel cinematic and grounded in lived reality, not like a generic essay or PSA.
-- Do NOT include bullet points or headings. Just the abstract text.
+- Cinematic + grounded (not a generic essay or PSA).
+- No bullet points, no headings — abstract only.
 
 Idea Board:
 ${ideaSummary || '(very few notes; make smart but grounded assumptions)'} 
 
-Now write the abstract.
+Return the abstract text now.
 `.trim();
 
     const out = await callOpenAI(
@@ -423,7 +691,7 @@ Now write the abstract.
         { role: 'system', content: sys },
         { role: 'user', content: prompt },
       ],
-      { maxTokens: 450 }
+      { maxTokens: 650, temperature: 0.75 }
     );
 
     return out;

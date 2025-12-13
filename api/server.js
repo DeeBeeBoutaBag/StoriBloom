@@ -1,8 +1,14 @@
+// server.js (FULL FILE — NO OMISSIONS)
+
 try {
   await import('dotenv/config');
 } catch (err) {
-  console.warn('[dotenv] not loaded (probably running on AWS with real env vars):', err?.message || err);
+  console.warn(
+    '[dotenv] not loaded (probably running on AWS with real env vars):',
+    err?.message || err
+  );
 }
+
 import express from 'express';
 import cors from 'cors';
 import path from 'node:path';
@@ -13,8 +19,12 @@ import { fileURLToPath } from 'node:url';
 // Optional deps
 let compression = null;
 let morgan = null;
-try { ({ default: compression } = await import('compression')); } catch {}
-try { ({ default: morgan } = await import('morgan')); } catch {}
+try {
+  ({ default: compression } = await import('compression'));
+} catch {}
+try {
+  ({ default: morgan } = await import('morgan'));
+} catch {}
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
@@ -40,16 +50,24 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .filter(Boolean);
 
 const TABLES = {
-  codes: process.env.DDB_TABLE_CODES || process.env.TABLE_CODES || 'storibloom_codes',
+  codes:
+    process.env.DDB_TABLE_CODES ||
+    process.env.TABLE_CODES ||
+    'storibloom_codes',
   rooms: process.env.DDB_TABLE_ROOMS || 'storibloom_rooms',
   messages: process.env.DDB_TABLE_MESSAGES || 'storibloom_messages',
   drafts: process.env.DDB_TABLE_DRAFTS || 'storibloom_drafts',
   personas: process.env.DDB_TABLE_PERSONAS || 'storibloom_personas',
   sessions: process.env.DDB_TABLE_SESSIONS || 'storibloom_sessions',
+
+  // Optional gallery table (if not provisioned, gallery endpoint falls back to room records)
+  gallery: process.env.DDB_TABLE_GALLERY || 'storibloom_gallery',
 };
 
 const WEB_DIST_DIR = process.env.WEB_DIST_DIR || '/opt/StoriBloom/web-dist';
 const ENABLE_SPA = String(process.env.STATIC_INDEX || '0') === '1';
+
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
 // ---------- AWS ----------
 const ddb = new DynamoDBClient({
@@ -99,7 +117,7 @@ app.use(
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-user-role'],
     credentials: true,
   })
 );
@@ -109,7 +127,9 @@ if (compression) app.use(compression());
 if (morgan) app.use(morgan('tiny'));
 
 app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  console.log(
+    `[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`
+  );
   next();
 });
 
@@ -145,6 +165,18 @@ async function requireAuth(req, res, next) {
   }
 }
 
+// Presenter gating (front-end should pass x-user-role: PRESENTER)
+function isPresenterReq(req) {
+  const h = String(req.headers['x-user-role'] || '').trim().toUpperCase();
+  return h === 'PRESENTER';
+}
+function requirePresenter(req, res, next) {
+  if (!isPresenterReq(req)) {
+    return res.status(403).json({ error: 'presenter_only' });
+  }
+  return next();
+}
+
 // ---------- Helpers ----------
 const DEFAULT_STAGE = 'LOBBY';
 const ROOM_ORDER = [
@@ -158,15 +190,15 @@ const ROOM_ORDER = [
   'CLOSED',
 ];
 
-// Align durations more closely with UI (Room.jsx TOTAL_BY_STAGE)
+// Align durations with UI (Room.jsx TOTAL_BY_STAGE) — milliseconds
 const STAGE_DURATIONS = {
-  LOBBY: 15 * 60_000,      // 15 min
-  DISCOVERY: 4 * 60_000,   // 4 min
-  IDEA_DUMP: 4 * 60_000,   // 4 min
-  PLANNING: 4 * 60_000,    // 4 min
-  ROUGH_DRAFT: 3 * 60_000, // 3 min
-  EDITING: 4 * 60_000,     // 4 min
-  FINAL: 3 * 60_000,       // 3 min
+  LOBBY: 1200 * 1000, // 10 min (adjust if desired)
+  DISCOVERY: 600 * 1000, // 10 min
+  IDEA_DUMP: 600 * 1000, // 10 min
+  PLANNING: 600 * 1000, // 10 min
+  ROUGH_DRAFT: 240 * 1000, // 4 min
+  EDITING: 600 * 1000, // 10 min
+  FINAL: 360 * 1000, // 6 min
 };
 function getStageDuration(stage) {
   return STAGE_DURATIONS[stage] || 6 * 60_000;
@@ -181,7 +213,7 @@ function advanceStageVal(stage) {
   const i = ROOM_ORDER.indexOf(stage || DEFAULT_STAGE);
   return i >= 0 && i < ROOM_ORDER.length - 1
     ? ROOM_ORDER[i + 1]
-    : (stage || DEFAULT_STAGE);
+    : stage || DEFAULT_STAGE;
 }
 
 function getSeatCount(room) {
@@ -198,7 +230,22 @@ async function getRoom(roomId) {
 async function ensureRoom(roomId) {
   let r = await getRoom(roomId);
   if (r) {
-    if (!Array.isArray(r.seats)) r.seats = []; // ensure seats exists
+    if (!Array.isArray(r.seats)) r.seats = [];
+
+    // Living draft defaults
+    if (typeof r.draftText !== 'string') r.draftText = '';
+    if (!Number.isFinite(Number(r.draftVersion))) r.draftVersion = 0;
+    if (!r.draftUpdatedAt) r.draftUpdatedAt = null;
+
+    // Final / gallery defaults
+    if (typeof r.finalAbstract !== 'string') r.finalAbstract = '';
+    if (!r.closedReason) r.closedReason = null;
+    if (!r.closedAt) r.closedAt = null;
+
+    // FINAL readiness defaults
+    if (!Array.isArray(r.finalReadyUids)) r.finalReadyUids = [];
+    if (!Number.isFinite(Number(r.finalReadyCount))) r.finalReadyCount = 0;
+
     return r;
   }
 
@@ -216,7 +263,7 @@ async function ensureRoom(roomId) {
     voteTotal: 0,
     voteTallies: {},
     greetedForStage: {},
-    seats: [], // track occupancy
+    seats: [],
 
     // voting readiness + submitted tracking
     voteReadyUids: [],
@@ -229,27 +276,38 @@ async function ensureRoom(roomId) {
     finalReadyCount: 0,
     finalCompletedAt: null,
 
+    // NEW: living draft (single source of truth)
+    draftText: '',
+    draftVersion: 0,
+    draftUpdatedAt: null,
+
+    // NEW: closure/gallery
+    finalAbstract: '',
+    closedReason: null,
+    closedAt: null,
+
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
 
-  await ddbDoc.send(
-    new PutCommand({ TableName: TABLES.rooms, Item: r })
-  );
+  await ddbDoc.send(new PutCommand({ TableName: TABLES.rooms, Item: r }));
   return r;
 }
 
 async function updateRoom(roomId, patch) {
   const next = {
-    ...(await getRoom(roomId)) || {},
+    ...((await getRoom(roomId)) || {}),
     roomId,
     ...patch,
     updatedAt: Date.now(),
   };
   if (!Array.isArray(next.seats)) next.seats = [];
-  await ddbDoc.send(
-    new PutCommand({ TableName: TABLES.rooms, Item: next })
-  );
+  if (typeof next.draftText !== 'string') next.draftText = '';
+  if (!Number.isFinite(Number(next.draftVersion))) next.draftVersion = 0;
+  if (!Array.isArray(next.finalReadyUids)) next.finalReadyUids = [];
+  if (!Number.isFinite(Number(next.finalReadyCount))) next.finalReadyCount = 0;
+
+  await ddbDoc.send(new PutCommand({ TableName: TABLES.rooms, Item: next }));
   stageEngine.touch(roomId);
   return next;
 }
@@ -292,13 +350,80 @@ async function getMessagesForRoom(roomId, limit = 200) {
       KeyConditionExpression: 'roomId = :r',
       ExpressionAttributeValues: { ':r': roomId },
       ScanIndexForward: true,
-      Limit: Math.min(500, limit),
+      Limit: Math.min(800, limit),
     })
   );
   return Items || [];
 }
 
-// Draft helpers
+// ---------- Stage Instructions ----------
+function stageInstructionText(stage) {
+  switch (stage) {
+    case 'LOBBY':
+      return [
+        '👋 **LOBBY (Orientation)**',
+        '• Pick your emoji persona (top-right).',
+        '• Send one test message: “Hello + one sentence about your day.”',
+        '• To ask me for help, start with: **Asema, ...**',
+      ].join('\n');
+
+    case 'DISCOVERY':
+      return [
+        '🧭 **DISCOVERY**',
+        '• Share a short story, memory, or observation about the issue.',
+        '• When you feel ready, click **I’m ready to vote**.',
+        '• Ask me: “Asema, ask us 3 deeper questions.”',
+      ].join('\n');
+
+    case 'IDEA_DUMP':
+      return [
+        '⚡ **IDEA DUMP**',
+        '• Drop fast bullets: characters, setting, conflict, turning point, what changes.',
+        '• Volume > perfection. No debating yet.',
+      ].join('\n');
+
+    case 'PLANNING':
+      return [
+        '🧩 **PLANNING**',
+        '• Use the Planning Board to choose 1 focus + 1 structure + 3 key beats.',
+        '• Click **Share plan with room** when it’s solid.',
+      ].join('\n');
+
+    case 'ROUGH_DRAFT':
+      return [
+        '📝 **ROUGH DRAFT**',
+        '• Click **Generate Rough Draft** (or say: “Asema, generate rough draft”).',
+        '• This becomes your living draft we will edit — not a one-off.',
+      ].join('\n');
+
+    case 'EDITING':
+      return [
+        '✂️ **EDITING**',
+        '• Give edit instructions like: “Replace the first sentence with…”',
+        '• Say “show what we have so far” anytime to see the latest version.',
+        '• I will apply edits to the SAME draft (versioned).',
+      ].join('\n');
+
+    case 'FINAL':
+      return [
+        '🏁 **FINAL**',
+        '• I’ll paste the latest draft. Make final tiny changes (clarity, punch, ending).',
+        '• When YOU are finished, type **done** (or **submit**).',
+        '• When time runs out, I’ll close automatically and post the final abstract.',
+      ].join('\n');
+
+    case 'CLOSED':
+      return [
+        '🔒 **CLOSED**',
+        '• Session is read-only now. Copy/screenshot the final abstract above.',
+      ].join('\n');
+
+    default:
+      return `⏱️ Moving into **${stage}**.`;
+  }
+}
+
+// ---------- Draft helpers (legacy drafts table kept as audit trail) ----------
 async function getLatestDraft(roomId) {
   const { Items } = await ddbDoc.send(
     new QueryCommand({
@@ -312,10 +437,32 @@ async function getLatestDraft(roomId) {
   return (Items && Items[0]) || null;
 }
 
+async function saveDraftSnapshot(roomId, content, version) {
+  const createdAt = Date.now();
+  await ddbDoc.send(
+    new PutCommand({
+      TableName: TABLES.drafts,
+      Item: {
+        roomId,
+        createdAt,
+        content: (content || '').trim(),
+        version: Number(version || 1),
+      },
+    })
+  );
+  return { createdAt };
+}
+
 async function generateRoughDraftForRoom(room, { force = false } = {}) {
-  if (!force) {
-    const existing = await getLatestDraft(room.roomId);
-    if (existing) return existing;
+  // NEW: generate into living draft (draftText); regen overwrites with new version
+  if (!force && room.draftText && room.draftText.trim()) {
+    return {
+      roomId: room.roomId,
+      createdAt: room.draftUpdatedAt || Date.now(),
+      content: room.draftText,
+      version: Number(room.draftVersion || 0),
+      reused: true,
+    };
   }
 
   try {
@@ -325,24 +472,18 @@ async function generateRoughDraftForRoom(room, { force = false } = {}) {
       room.roomId
     );
     const draft = (text || '').trim();
-    const createdAt = Date.now();
 
-    const prev = await getLatestDraft(room.roomId);
+    const nextVersion = Number(room.draftVersion || 0) + 1;
+    const updated = await updateRoom(room.roomId, {
+      draftText: draft,
+      draftVersion: nextVersion,
+      draftUpdatedAt: Date.now(),
+    });
 
-    await ddbDoc.send(
-      new PutCommand({
-        TableName: TABLES.drafts,
-        Item: {
-          roomId: room.roomId,
-          createdAt,
-          content: draft,
-          version: prev ? (prev.version || 1) + 1 : 1,
-        },
-      })
-    );
+    await saveDraftSnapshot(room.roomId, draft, nextVersion);
 
     await addMessage(room.roomId, {
-      text: draft,
+      text: `📝 **Rough Draft (v${nextVersion})**\n\n${draft}`,
       phase: 'ROUGH_DRAFT',
       authorType: 'asema',
       personaIndex: 0,
@@ -351,145 +492,184 @@ async function generateRoughDraftForRoom(room, { force = false } = {}) {
     console.log(
       `[rough] generated for ${room.roomId}, ~${draft.split(/\s+/).length} words`
     );
-    return { roomId: room.roomId, createdAt, content: draft };
+
+    return {
+      roomId: room.roomId,
+      createdAt: updated.draftUpdatedAt,
+      content: draft,
+      version: nextVersion,
+    };
   } catch (e) {
     console.error('[rough] generation failed:', e?.message || e);
     const fallback =
       'Draft unavailable due to an AI error. Continue discussing your 250-word abstract together.';
-    const createdAt = Date.now();
 
-    const prev = await getLatestDraft(room.roomId);
+    const nextVersion = Number(room.draftVersion || 0) + 1;
+    const updated = await updateRoom(room.roomId, {
+      draftText: fallback,
+      draftVersion: nextVersion,
+      draftUpdatedAt: Date.now(),
+    });
 
-    await ddbDoc.send(
-      new PutCommand({
-        TableName: TABLES.drafts,
-        Item: {
-          roomId: room.roomId,
-          createdAt,
-          content: fallback,
-          version: prev ? (prev.version || 1) + 1 : 1,
-        },
-      })
-    );
+    await saveDraftSnapshot(room.roomId, fallback, nextVersion);
+
     await addMessage(room.roomId, {
-      text: fallback,
+      text: `📝 **Rough Draft (v${nextVersion})**\n\n${fallback}`,
       phase: 'ROUGH_DRAFT',
       authorType: 'asema',
       personaIndex: 0,
     });
 
-    return { roomId: room.roomId, createdAt, content: fallback };
+    return {
+      roomId: room.roomId,
+      createdAt: updated.draftUpdatedAt,
+      content: fallback,
+      version: nextVersion,
+    };
   }
 }
 
-// Pick the best "final" text for the room, preferring EDITING-phase messages
-// (usually the polished abstract) and falling back to the latest rough draft
-// or ideaSummary if needed.
-async function getBestFinalText(roomId) {
-  // All messages for this room
-  const all = await getMessagesForRoom(roomId, 800);
-
-  let editingCandidate = null;
-  let editingAsemaCandidate = null;
-
-  // Walk from newest → oldest
-  for (let i = all.length - 1; i >= 0; i--) {
-    const m = all[i];
-    const phase = m.phase || '';
-    if (phase !== 'EDITING') continue;
-    const txt = (m.text || '').trim();
-    if (!txt) continue;
-
-    // Prefer Asema’s last EDITING message if present
-    if (m.authorType === 'asema' && !editingAsemaCandidate) {
-      editingAsemaCandidate = txt;
-      break; // strongest candidate
-    }
-
-    // Otherwise remember the last EDITING message from anyone
-    if (!editingCandidate) {
-      editingCandidate = txt;
-    }
-  }
-
-  if (editingAsemaCandidate) return editingAsemaCandidate;
-  if (editingCandidate) return editingCandidate;
-
-  // If nobody rewrote it in EDITING, fall back to latest saved draft
-  const latestDraft = await getLatestDraft(roomId);
-  if (latestDraft && latestDraft.content && latestDraft.content.trim()) {
-    return latestDraft.content.trim();
-  }
-
-  // Last fallback: the ideaSummary (shorter, but better than nothing)
-  const room = await ensureRoom(roomId);
-  if (room.ideaSummary && room.ideaSummary.trim()) {
-    return room.ideaSummary.trim();
-  }
-
-  return '';
+// ---------- Editing: apply edits to the SAME living draft ----------
+function clipText(s, max = 9000) {
+  const t = String(s || '');
+  if (t.length <= max) return t;
+  return t.slice(0, max) + '\n\n[...clipped...]';
 }
 
-// Helper: complete the FINAL stage for a room (closing message + final abstract)
-async function completeFinalSession(room) {
-  const roomId = room.roomId;
-  const stage = room.stage || 'LOBBY';
+async function callOpenAIForEdit({ topic, stage, baseDraft, instructions }) {
+  const client = getOpenAI();
+  const sys = `
+You are Asema — a warm, witty, clear workshop host helping a small group craft a ~250-word story abstract.
 
-  // If already closed, just echo back
-  if (stage === 'CLOSED') {
-    const seatsClosed = getSeatCount(room);
-    return {
-      ok: true,
-      closed: true,
-      stage: room.stage,
-      finalCompletedAt: room.finalCompletedAt || Date.now(),
-      readyCount: Number(room.finalReadyCount || 0),
-      seats: seatsClosed,
-      alreadyClosed: true,
-    };
-  }
+IMPORTANT:
+- You are editing ONE existing draft.
+- Preserve the same protagonist/setting/plot unless the user explicitly asks to change them.
+- Do NOT generate a totally new draft.
+- Keep length close to ~250 words.
+- Output ONLY the updated abstract text (no headings, no bullets, no commentary).
+`.trim();
 
-  if (stage !== 'FINAL') {
-    return {
-      ok: false,
-      reason: 'not_in_final',
-      stage,
-    };
-  }
+  const user = `
+Stage: ${stage}
+Topic: ${topic || '(not locked)'}
+User edit request:
+${instructions}
 
-  const readyCount = Number(room.finalReadyCount || 0);
-  const seats = getSeatCount(room);
+Current draft:
+${baseDraft}
 
-  // 🔑 Pull the best final text (EDITING → rough draft → ideaSummary)
-  const finalText = await getBestFinalText(roomId);
-  const hasFinal = !!finalText && finalText.trim().length > 0;
+Return the updated draft now.
+`.trim();
 
-  // 1) Closing ceremony message
-  const closingLines = [];
-  closingLines.push('🏁 **Session complete.** Beautiful work, team.');
-  if (seats > 0) {
-    closingLines.push(
-      `**${readyCount} / ${seats}** teammates clicked **done** — that’s your consensus on this abstract.`
-    );
-  }
-  if (room.topic) {
-    closingLines.push(`You just wrapped a story on **${room.topic}**.`);
-  }
-  closingLines.push(
-    'Screenshot or copy your final abstract below — this is your group’s shared version. Build on it after the workshop.'
+  const res = await client.chat.completions.create({
+    model: OPENAI_MODEL,
+    messages: [
+      { role: 'system', content: sys },
+      { role: 'user', content: user },
+    ],
+    temperature: 0.35,
+    max_tokens: 700,
+  });
+
+  return (res.choices?.[0]?.message?.content || '').trim();
+}
+
+async function applyDraftEdits(room, instructions) {
+  const baseDraft = (room.draftText || '').trim();
+
+  const updatedText = await callOpenAIForEdit({
+    topic: room.topic || '',
+    stage: room.stage || 'EDITING',
+    baseDraft: clipText(baseDraft || '(empty draft)', 9000),
+    instructions: String(instructions || ''),
+  });
+
+  const next = (updatedText || '').trim();
+  const nextVersion = Number(room.draftVersion || 0) + 1;
+
+  const updatedRoom = await updateRoom(room.roomId, {
+    draftText: next,
+    draftVersion: nextVersion,
+    draftUpdatedAt: Date.now(),
+  });
+
+  await saveDraftSnapshot(room.roomId, next, nextVersion);
+
+  return { updatedRoom, draftText: next, version: nextVersion };
+}
+
+// ---------- Intent helpers ----------
+function wantsShowDraft(text) {
+  const t = String(text || '').toLowerCase();
+  return (
+    t.includes('show what we have') ||
+    t.includes('show the draft') ||
+    t.includes('show latest') ||
+    t.includes('paste the draft') ||
+    t.includes('what do we have so far') ||
+    t.includes('latest version') ||
+    t.includes('current version')
   );
+}
 
+function looksLikeEditInstruction(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
+  const patterns = [
+    'replace',
+    'change',
+    'rewrite',
+    'revise',
+    'tighten',
+    'shorten',
+    'expand',
+    'remove',
+    'cut',
+    'fix',
+    'edit',
+    'swap',
+    'update',
+    'clarify',
+    'make it',
+    'make this',
+  ];
+  return patterns.some((p) => t.includes(p));
+}
+
+function isDoneWord(text) {
+  const t = String(text || '').trim().toLowerCase();
+  return t === 'done' || t === 'submit';
+}
+
+// ---------- Close room + post final abstract + save to room + optional gallery ----------
+async function closeRoomWithFinal(
+  room,
+  { reason = 'manual', closedBy = '(system)' } = {}
+) {
+  const roomId = room.roomId;
+
+  // Final abstract should be the latest living draft
+  const finalAbstract = (room.draftText || '').trim();
+
+  // Closing line
   await addMessage(roomId, {
-    text: closingLines.join(' '),
+    text:
+      reason === 'timeout'
+        ? '⏰ **Time’s up — closing the room now.**'
+        : reason === 'presenter'
+        ? '🧑‍🏫 **Presenter closed the room — great work.**'
+        : reason === 'all_done'
+        ? '✅ **Everyone is done — locking the final abstract.**'
+        : '🏁 **Room closed — beautiful work.**',
     phase: 'FINAL',
     authorType: 'asema',
     personaIndex: 0,
   });
 
-  // 2) Paste the actual final abstract
-  if (hasFinal) {
+  // Paste final abstract
+  if (finalAbstract) {
     await addMessage(roomId, {
-      text: `**Final Abstract**\n\n${finalText}`,
+      text: `**Final Abstract**\n\n${finalAbstract}`,
       phase: 'FINAL',
       authorType: 'asema',
       personaIndex: 0,
@@ -497,29 +677,117 @@ async function completeFinalSession(room) {
   } else {
     await addMessage(roomId, {
       text:
-        'I couldn’t find a full edited abstract — your chat log is still full of strong lines. Copy what you like and keep writing offline.',
+        'I don’t see a saved draft yet — copy the strongest lines from your chat and keep building offline.',
       phase: 'FINAL',
       authorType: 'asema',
       personaIndex: 0,
     });
   }
 
-  // 3) Lock + close
-  const finalCompletedAt = Date.now();
+  const closedAt = Date.now();
+
   const updated = await updateRoom(roomId, {
     stage: 'CLOSED',
     inputLocked: true,
-    finalCompletedAt,
+    finalCompletedAt: closedAt,
+    finalAbstract: finalAbstract || '',
+    closedReason: reason,
+    closedAt,
   });
 
-  return {
-    ok: true,
-    closed: true,
-    stage: updated.stage,
-    finalCompletedAt,
-    readyCount,
-    seats,
-  };
+  // Optional gallery write (if table exists)
+  try {
+    await ddbDoc.send(
+      new PutCommand({
+        TableName: TABLES.gallery,
+        Item: {
+          siteId: updated.siteId,
+          roomId: updated.roomId,
+          closedAt,
+          index: updated.index,
+          topic: updated.topic || '',
+          abstract: updated.finalAbstract || '',
+          closedBy,
+        },
+      })
+    );
+  } catch (e) {
+    console.warn('[gallery] put skipped (table may not exist):', e?.message || e);
+  }
+
+  return updated;
+}
+
+// ---------- FINAL: readiness + auto-close (supports typing "done" in normal chat) ----------
+async function markFinalReady(roomId, uid) {
+  const r = await ensureRoom(roomId);
+  if ((r.stage || 'LOBBY') !== 'FINAL') {
+    return { ok: false, stage: r.stage || 'LOBBY' };
+  }
+
+  let readyUids = Array.isArray(r.finalReadyUids) ? r.finalReadyUids.slice() : [];
+  if (!readyUids.includes(uid)) readyUids.push(uid);
+
+  const updated = await updateRoom(roomId, {
+    finalReadyUids: readyUids,
+    finalReadyCount: readyUids.length,
+  });
+
+  const seats = getSeatCount(updated);
+  const readyCount = Number(updated.finalReadyCount || 0);
+
+  let autoClosed = false;
+  if (seats > 0 && readyCount >= seats) {
+    try {
+      await closeRoomWithFinal(updated, { reason: 'all_done', closedBy: '(all_done)' });
+      autoClosed = true;
+    } catch (e) {
+      console.error('[final ready] auto-close error', e);
+    }
+  }
+
+  return { ok: true, readyCount, seats, autoClosed };
+}
+
+// ---------- FINAL: true auto-close even if nobody polls /state ----------
+const finalCloseTimers = new Map(); // roomId -> Timeout
+
+function scheduleFinalAutoClose(room) {
+  try {
+    const roomId = room.roomId;
+    if (!roomId) return;
+
+    // clear any existing timer
+    const prev = finalCloseTimers.get(roomId);
+    if (prev) {
+      clearTimeout(prev);
+      finalCloseTimers.delete(roomId);
+    }
+
+    // only schedule in FINAL
+    if ((room.stage || 'LOBBY') !== 'FINAL') return;
+
+    const endsAt = Number(room.stageEndsAt || 0);
+    if (!endsAt) return;
+
+    const delay = Math.max(0, endsAt - Date.now()) + 250;
+
+    const t = setTimeout(async () => {
+      try {
+        const r = await ensureRoom(roomId);
+        if ((r.stage || 'LOBBY') !== 'FINAL') return;
+        if (r.stage === 'CLOSED') return;
+        await closeRoomWithFinal(r, { reason: 'timeout', closedBy: '(timer)' });
+      } catch (e) {
+        console.error('[FINAL auto-close timer] error', e?.message || e);
+      }
+    }, delay);
+
+    finalCloseTimers.set(roomId, t);
+    if (typeof t.unref === 'function') t.unref();
+  } catch (e) {
+    console.error('[scheduleFinalAutoClose] error', e?.message || e);
+  }
 }
 
 // ---------- Room Assignment (6 per room, up to 5 rooms) ----------
@@ -568,9 +836,7 @@ async function assignRoomForUser(siteIdRaw, uid) {
 
   // Pick first room with < 6 seats, else last room as overflow
   let target = rooms.find((r) => r.seats.length < MAX_SEATS);
-  if (!target) {
-    target = rooms[rooms.length - 1];
-  }
+  if (!target) target = rooms[rooms.length - 1];
 
   const newSeats = [...target.seats, { uid }];
   await updateRoom(target.roomId, { seats: newSeats });
@@ -606,15 +872,15 @@ const stageEngine = createStageEngine({
     try {
       const stage = room.stage || 'LOBBY';
 
-      // 1) Always drop a short nudge from Asema on stage change
+      // 1) Always drop stage instructions on stage change
       await addMessage(room.roomId, {
-        text: `⏱️ Moving into **${stage}**. Keep building together and call on me when you’re ready.`,
+        text: stageInstructionText(stage),
         phase: stage,
         authorType: 'asema',
         personaIndex: 0,
       });
 
-      // 2) DISCOVERY: one-time room greeting (not per user)
+      // 2) Optional deeper greet for DISCOVERY
       if (stage === 'DISCOVERY') {
         try {
           const text = await Asema.greet(stage, room.topic || '');
@@ -629,49 +895,57 @@ const stageEngine = createStageEngine({
         }
       }
 
-      // 3) Special handling for EDITING:
-      //    - Re-post the latest rough draft into this stage so people can edit it in context.
+      // 3) EDITING: paste the latest living draft as the base editing reference
       if (stage === 'EDITING') {
-        try {
-          const latestDraft = await getLatestDraft(room.roomId);
-          if (latestDraft && latestDraft.content) {
-            // Small intro line so they know what it is
-            await addMessage(room.roomId, {
-              text: '✂️ Here’s your rough draft again — copy lines, rewrite them, and ask me for tighter versions.',
-              phase: 'EDITING',
-              authorType: 'asema',
-              personaIndex: 0,
-            });
-
-            // The actual draft text as the main editing reference
-            await addMessage(room.roomId, {
-              text: latestDraft.content,
-              phase: 'EDITING',
-              authorType: 'asema',
-              personaIndex: 0,
-            });
-          } else {
-            // No saved draft (edge case)
-            await addMessage(room.roomId, {
-              text: 'I don’t see a rough draft saved yet — generate one in the ROUGH_DRAFT stage first, then we’ll polish it here.',
-              phase: 'EDITING',
-              authorType: 'asema',
-              personaIndex: 0,
-            });
-          }
-        } catch (err) {
-          console.error('[stageEngine EDITING] failed to load draft', err);
+        const draft = (room.draftText || '').trim();
+        if (draft) {
+          await addMessage(room.roomId, {
+            text: `🧾 **Latest Draft (v${Number(room.draftVersion || 0)})**\n\n${draft}`,
+            phase: 'EDITING',
+            authorType: 'asema',
+            personaIndex: 0,
+          });
+        } else {
+          await addMessage(room.roomId, {
+            text: 'I don’t see a saved draft yet — generate one in ROUGH_DRAFT first.',
+            phase: 'EDITING',
+            authorType: 'asema',
+            personaIndex: 0,
+          });
         }
       }
 
-      // No greetedForStage reset — greeting is owned by stage transitions, not /welcome.
+      // 4) FINAL: greet + paste last edited living draft immediately
+      if (stage === 'FINAL') {
+        const draft = (room.draftText || '').trim();
+        const v = Number(room.draftVersion || 0);
+
+        await addMessage(room.roomId, {
+          text:
+            `🏁 **FINAL STAGE**\n` +
+            `Make your last edits to the draft below. When YOU are finished, type **done** (or **submit**).\n\n` +
+            `🧾 **Draft (v${v})**\n\n${draft || '(No draft saved yet.)'}`,
+          phase: 'FINAL',
+          authorType: 'asema',
+          personaIndex: 0,
+        });
+
+        // Schedule true auto-close at FINAL end (even if nobody polls /state)
+        scheduleFinalAutoClose(room);
+      } else {
+        // If we left FINAL, clear timer
+        const prev = finalCloseTimers.get(room.roomId);
+        if (prev) {
+          clearTimeout(prev);
+          finalCloseTimers.delete(room.roomId);
+        }
+      }
     } catch (e) {
       console.error('[stageEngine onStageAdvanced] error', e);
     }
   },
 });
 stageEngine.start();
-
 
 // ---------- Health ----------
 app.get('/health', (_req, res) =>
@@ -689,7 +963,7 @@ app.get('/version', (_req, res) =>
 );
 
 // ---------- Presenter: list rooms ----------
-app.get('/presenter/rooms', requireAuth, async (req, res) => {
+app.get('/presenter/rooms', requireAuth, requirePresenter, async (req, res) => {
   const siteId = String(req.query.siteId || '').trim().toUpperCase();
   if (!siteId) return res.json({ rooms: [] });
 
@@ -710,10 +984,53 @@ app.get('/presenter/rooms', requireAuth, async (req, res) => {
         total: Number(r.voteTotal || 0),
         tallies: r.voteTallies || {},
       },
+
+      // draft + final preview
+      draftVersion: Number(r.draftVersion || 0),
+      draftUpdatedAt: r.draftUpdatedAt || null,
+      finalAbstract: r.finalAbstract || '',
+      closedAt: r.closedAt || null,
+      closedReason: r.closedReason || null,
     });
     stageEngine.touch(id);
   }
   res.json({ rooms: out });
+});
+
+// Presenter gallery (all closed abstracts for site)
+app.get('/presenter/gallery', requireAuth, requirePresenter, async (req, res) => {
+  const siteId = String(req.query.siteId || '').trim().toUpperCase();
+  if (!siteId) return res.json({ items: [] });
+
+  // If TABLES.gallery exists with PK=siteId, query it; else fallback to rooms
+  try {
+    const { Items } = await ddbDoc.send(
+      new QueryCommand({
+        TableName: TABLES.gallery,
+        KeyConditionExpression: 'siteId = :s',
+        ExpressionAttributeValues: { ':s': siteId },
+        ScanIndexForward: false,
+        Limit: 50,
+      })
+    );
+    return res.json({ items: Items || [] });
+  } catch (e) {
+    const items = [];
+    for (let i = 1; i <= 5; i++) {
+      const r = await ensureRoom(`${siteId}-${i}`);
+      if (r.stage === 'CLOSED' && (r.finalAbstract || '').trim()) {
+        items.push({
+          siteId,
+          roomId: r.roomId,
+          closedAt: r.closedAt || r.finalCompletedAt || null,
+          index: r.index,
+          topic: r.topic || '',
+          abstract: r.finalAbstract || '',
+        });
+      }
+    }
+    return res.json({ items });
+  }
 });
 
 // ---------- Room state & messages ----------
@@ -742,13 +1059,14 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
   }
 
   stageEngine.touch(roomId);
+  r = await ensureRoom(roomId);
 
   res.json({
     id: r.roomId,
     siteId: r.siteId,
     index: r.index,
-    stage,
-    stageEndsAt: endsAtMs,
+    stage: r.stage || 'LOBBY',
+    stageEndsAt: toMs(r.stageEndsAt),
     inputLocked: !!r.inputLocked,
     topic: r.topic || '',
     ideaSummary: r.ideaSummary || '',
@@ -756,9 +1074,15 @@ app.get('/rooms/:roomId/state', requireAuth, async (req, res) => {
     seats: getSeatCount(r),
     finalReadyCount: Number(r.finalReadyCount || 0),
     finalCompletedAt: r.finalCompletedAt || null,
+
+    // living draft meta + final abstract
+    draftVersion: Number(r.draftVersion || 0),
+    draftUpdatedAt: r.draftUpdatedAt || null,
+    finalAbstract: r.finalAbstract || '',
+    closedAt: r.closedAt || null,
+    closedReason: r.closedReason || null,
   });
 });
-
 
 app.post('/rooms/:roomId/messages', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
@@ -767,7 +1091,31 @@ app.post('/rooms/:roomId/messages', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'text required' });
   }
 
-  const r = await ensureRoom(roomId);
+  let r = await ensureRoom(roomId);
+
+  // If user types "done/submit" during FINAL in normal chat, mark them ready
+  if ((r.stage || 'LOBBY') === 'FINAL' && isDoneWord(text)) {
+    // still store their message (so the room sees who’s done)
+    const saved = await addMessage(roomId, {
+      text,
+      phase: phase || r.stage || 'FINAL',
+      authorType: 'user',
+      personaIndex,
+      uid: req.user.uid,
+      emoji: emoji || null,
+    });
+
+    const readyRes = await markFinalReady(roomId, req.user.uid);
+
+    return res.json({
+      ok: true,
+      createdAt: saved.createdAt,
+      finalReady: true,
+      readyCount: readyRes.ok ? readyRes.readyCount : undefined,
+      seats: readyRes.ok ? readyRes.seats : undefined,
+      autoClosed: readyRes.ok ? readyRes.autoClosed : undefined,
+    });
+  }
 
   // Keep ROUGH_DRAFT open; respect lock elsewhere except FINAL
   if (
@@ -818,6 +1166,12 @@ app.post('/rooms/:roomId/extend', requireAuth, async (req, res) => {
   const updated = await updateRoom(roomId, {
     stageEndsAt: (cur.stageEndsAt || Date.now()) + by * 1000,
   });
+
+  // If extending FINAL, reschedule the real auto-close timer
+  if ((updated.stage || 'LOBBY') === 'FINAL') {
+    scheduleFinalAutoClose(updated);
+  }
+
   res.json({ ok: true, stageEndsAt: updated.stageEndsAt });
 });
 
@@ -825,14 +1179,16 @@ app.post('/rooms/:roomId/redo', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const updated = await updateRoom(roomId, {
     stage: 'ROUGH_DRAFT',
-    stageEndsAt: Date.now() + 10 * 60_000,
+    stageEndsAt: Date.now() + getStageDuration('ROUGH_DRAFT'),
     inputLocked: false,
+    finalReadyUids: [],
+    finalReadyCount: 0,
+    finalCompletedAt: null,
+    closedAt: null,
+    closedReason: null,
+    finalAbstract: '',
   });
-  res.json({
-    ok: true,
-    stage: updated.stage,
-    stageEndsAt: updated.stageEndsAt,
-  });
+  res.json({ ok: true, stage: updated.stage, stageEndsAt: updated.stageEndsAt });
 });
 
 app.post('/rooms/:roomId/lock', requireAuth, async (req, res) => {
@@ -843,7 +1199,6 @@ app.post('/rooms/:roomId/lock', requireAuth, async (req, res) => {
 });
 
 // ---------- Voting ----------
-// Default set of issues (shared with UI conceptually)
 const ISSUE_MAP = {
   1: 'Law Enforcement Profiling',
   2: 'Food Deserts',
@@ -852,8 +1207,6 @@ const ISSUE_MAP = {
   5: 'Wealth Gap',
 };
 
-// Participant clicks "Ready to vote" in DISCOVERY.
-// Once >= 50% of seats are ready, voting opens automatically.
 app.post('/rooms/:roomId/vote/ready', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const uid = req.user?.uid;
@@ -881,8 +1234,6 @@ app.post('/rooms/:roomId/vote/ready', requireAuth, async (req, res) => {
     voteReadyCount,
   };
 
-  // When at least half the room is ready and voting isn't open yet,
-  // open the topic vote automatically.
   if (!room.voteOpen && threshold > 0 && voteReadyCount >= threshold) {
     patch = {
       ...patch,
@@ -893,10 +1244,10 @@ app.post('/rooms/:roomId/vote/ready', requireAuth, async (req, res) => {
       voteSubmittedCount: 0,
     };
 
-    // Optional: drop a quick Asema message announcing the vote
     try {
       await addMessage(roomId, {
-        text: '🗳️ At least half the room is ready — opening topic voting now. Pick one option that fits your story best.',
+        text:
+          '🗳️ At least half the room is ready — opening topic voting now. Pick one option that fits your story best.',
         phase: 'DISCOVERY',
         authorType: 'asema',
         personaIndex: 0,
@@ -926,9 +1277,7 @@ app.get('/rooms/:roomId/vote', requireAuth, async (req, res) => {
     label,
   }));
   const counts = optionEntries.map(({ num }) =>
-    Number.isFinite(Number(tallies[num]))
-      ? Number(tallies[num])
-      : 0
+    Number.isFinite(Number(tallies[num])) ? Number(tallies[num]) : 0
   );
 
   const votesReceived = counts.reduce(
@@ -994,7 +1343,6 @@ app.post('/rooms/:roomId/vote/submit', requireAuth, async (req, res) => {
   const voteTotal = Number(r.voteTotal || 0) + 1;
   const seats = getSeatCount(r);
 
-  // First update with new tallies + submissions
   let updated = await updateRoom(roomId, {
     voteTallies: tallies,
     voteTotal,
@@ -1002,7 +1350,6 @@ app.post('/rooms/:roomId/vote/submit', requireAuth, async (req, res) => {
     voteSubmittedCount,
   });
 
-  // If all seated participants have voted, auto-close and set topic
   if (seats > 0 && voteSubmittedCount >= seats && updated.voteOpen) {
     const entries = Object.entries(tallies);
     let topic = updated.topic || '';
@@ -1019,7 +1366,6 @@ app.post('/rooms/:roomId/vote/submit', requireAuth, async (req, res) => {
       topic,
     });
 
-    // Optional: announce locked topic
     try {
       await addMessage(roomId, {
         text: `🔒 Topic locked in: **${topic}** — keep everything focused around this issue as you move forward.`,
@@ -1060,7 +1406,6 @@ app.post('/rooms/:roomId/vote/close', requireAuth, async (req, res) => {
 });
 
 // ---------- Idea summarization (Discovery + Idea Dump + Planning) ----------
-// Throttle summaries so OpenAI isn't hammered when lots of people type.
 const IDEA_MIN_INTERVAL_MS = 20_000; // 20s per room
 const ideaLastRun = new Map(); // roomId -> timestamp
 
@@ -1082,8 +1427,7 @@ async function summarizeIdeas(roomId) {
   const humanLines = all
     .filter(
       (m) =>
-        phases.includes(m.phase || '') &&
-        (m.authorType || 'user') === 'user'
+        phases.includes(m.phase || '') && (m.authorType || 'user') === 'user'
     )
     .map((m) => m.text);
 
@@ -1096,11 +1440,7 @@ async function summarizeIdeas(roomId) {
   }
 
   try {
-    const summary = await Asema.summarizeIdeas(
-      stage,
-      r.topic || '',
-      humanLines
-    );
+    const summary = await Asema.summarizeIdeas(stage, r.topic || '', humanLines);
     await updateRoom(roomId, {
       ideaSummary: summary,
       lastIdeaSummaryAt: Date.now(),
@@ -1125,7 +1465,6 @@ app.post('/rooms/:roomId/ideas/trigger', requireAuth, async (req, res) => {
 });
 
 // ---------- AI Greeting & Ask ----------
-// Ask throttle so one excited teen can't spam your OpenAI key
 const ASK_MIN_INTERVAL_MS = 4_000; // 4s per room
 const askLastRun = new Map(); // roomId -> timestamp
 
@@ -1137,9 +1476,51 @@ function shouldRunAsk(roomId) {
   return true;
 }
 
-// Legacy welcome endpoint (no-op): greeting now handled by stage engine on DISCOVERY
+// Legacy welcome endpoint (no-op)
 app.post('/rooms/:roomId/welcome', requireAuth, async (req, res) => {
   return res.json({ ok: true, disabled: true });
+});
+
+// GET current living draft
+app.get('/rooms/:roomId/draft', requireAuth, async (req, res) => {
+  const room = await ensureRoom(req.params.roomId);
+  return res.json({
+    ok: true,
+    draftText: room.draftText || '',
+    draftVersion: Number(room.draftVersion || 0),
+    draftUpdatedAt: room.draftUpdatedAt || null,
+  });
+});
+
+// Edit the living draft (EDITING / FINAL)
+app.post('/rooms/:roomId/draft/edit', requireAuth, async (req, res) => {
+  const roomId = req.params.roomId;
+  const { instructions } = req.body || {};
+  if (!instructions || typeof instructions !== 'string') {
+    return res.status(400).json({ error: 'instructions required' });
+  }
+
+  let room = await ensureRoom(roomId);
+  const stage = room.stage || 'LOBBY';
+  if (!['EDITING', 'FINAL'].includes(stage)) {
+    return res.status(400).json({ error: 'wrong_stage', stage });
+  }
+
+  try {
+    const { draftText, version } = await applyDraftEdits(room, instructions);
+
+    await addMessage(roomId, {
+      text: `✅ **Updated Draft (v${version})**\n\n${draftText}`,
+      phase: stage,
+      authorType: 'asema',
+      personaIndex: 0,
+    });
+
+    return res.json({ ok: true, version });
+  } catch (e) {
+    console.error('[draft/edit] error', e?.message || e);
+    return res.status(500).json({ error: 'edit_failed' });
+  }
 });
 
 app.post('/rooms/:roomId/ask', requireAuth, async (req, res) => {
@@ -1152,14 +1533,51 @@ app.post('/rooms/:roomId/ask', requireAuth, async (req, res) => {
   let r = await ensureRoom(roomId);
   const stage = r.stage || 'LOBBY';
 
-  // Capture topic utterances
-  const extracted = Asema.extractTopicFromUtterance(text);
-  if (extracted) {
-    await updateRoom(roomId, { topic: extracted });
-    r = await ensureRoom(roomId);
+  // If user asks to show latest draft, paste current living draft
+  if (wantsShowDraft(text)) {
+    const d = (r.draftText || '').trim();
+    if (d) {
+      await addMessage(roomId, {
+        text: `🧾 **Latest Draft (v${Number(r.draftVersion || 0)})**\n\n${d}`,
+        phase: stage,
+        authorType: 'asema',
+      });
+    } else {
+      await addMessage(roomId, {
+        text: 'I don’t see a saved draft yet. Generate one in ROUGH_DRAFT first.',
+        phase: stage,
+        authorType: 'asema',
+      });
+    }
+    return res.json({ ok: true, showedDraft: true });
   }
 
-  // Throttle actual OpenAI calls per room; still respond with a small hint
+  // In EDITING/FINAL, treat edit-like messages as edit instructions (edits SAME draft)
+  if (
+    (stage === 'EDITING' || stage === 'FINAL') &&
+    looksLikeEditInstruction(text)
+  ) {
+    try {
+      const { draftText, version } = await applyDraftEdits(r, text);
+      await addMessage(roomId, {
+        text: `✅ **Updated Draft (v${version})**\n\n${draftText}`,
+        phase: stage,
+        authorType: 'asema',
+      });
+      return res.json({ ok: true, edited: true, version });
+    } catch (e) {
+      console.error('[ask edit flow] error', e);
+      await addMessage(roomId, {
+        text:
+          'I had trouble applying that edit. Try specifying exactly what to replace or which paragraph to change.',
+        phase: stage,
+        authorType: 'asema',
+      });
+      return res.json({ ok: true, fallback: true });
+    }
+  }
+
+  // Throttle actual OpenAI calls per room
   if (!shouldRunAsk(roomId)) {
     await addMessage(roomId, {
       text:
@@ -1198,15 +1616,10 @@ app.post('/rooms/:roomId/draft/generate', requireAuth, async (req, res) => {
   try {
     const room = await ensureRoom(roomId);
     if ((room.stage || 'LOBBY') !== 'ROUGH_DRAFT') {
-      return res
-        .status(400)
-        .json({ error: 'wrong_stage', stage: room.stage });
+      return res.status(400).json({ error: 'wrong_stage', stage: room.stage });
     }
 
-    const force =
-      mode === 'regen' ||
-      mode === 'regenerate' ||
-      mode === 'ask';
+    const force = mode === 'regen' || mode === 'regenerate' || mode === 'ask';
 
     const draft = await generateRoughDraftForRoom(room, { force });
     res.json({ ok: true, ...draft });
@@ -1220,27 +1633,32 @@ app.post('/rooms/:roomId/final/start', requireAuth, async (_req, res) =>
   res.json({ ok: true })
 );
 
-app.post('/rooms/:roomId/final/complete', requireAuth, async (req, res) => {
+// Presenter manual close button (FINAL stage only)
+app.post('/rooms/:roomId/final/close', requireAuth, requirePresenter, async (req, res) => {
   const roomId = req.params.roomId;
+  const room = await ensureRoom(roomId);
+  if ((room.stage || 'LOBBY') !== 'FINAL') {
+    return res.status(400).json({ error: 'wrong_stage', stage: room.stage });
+  }
 
   try {
-    const room = await ensureRoom(roomId);
-    const result = await completeFinalSession(room);
-
-    if (!result.ok && result.stage && result.stage !== 'CLOSED') {
-      return res
-        .status(400)
-        .json({ error: 'wrong_stage', stage: result.stage });
-    }
-
-    return res.json(result);
+    const updated = await closeRoomWithFinal(room, {
+      reason: 'presenter',
+      closedBy: req.user.uid,
+    });
+    return res.json({
+      ok: true,
+      closed: true,
+      stage: updated.stage,
+      closedAt: updated.closedAt,
+    });
   } catch (e) {
-    console.error('[final/complete] error', e);
-    return res.status(500).json({ error: 'final_complete_failed' });
+    console.error('[final/close] error', e);
+    return res.status(500).json({ error: 'close_failed' });
   }
 });
 
-// Mark a participant as "ready" in FINAL stage (called when they type "done"/"submit")
+// Mark a participant as "ready" in FINAL stage (called when they click done/submit)
 app.post('/rooms/:roomId/final/ready', requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
   const uid = req.user?.uid;
@@ -1248,47 +1666,17 @@ app.post('/rooms/:roomId/final/ready', requireAuth, async (req, res) => {
     return res.status(401).json({ error: 'no_uid' });
   }
 
-  const r = await ensureRoom(roomId);
-  const stage = r.stage || 'LOBBY';
-  if (stage !== 'FINAL') {
-    return res.status(400).json({ error: 'wrong_stage', stage });
-  }
-
-  let readyUids = Array.isArray(r.finalReadyUids)
-    ? r.finalReadyUids.slice()
-    : [];
-  if (!readyUids.includes(uid)) {
-    readyUids.push(uid);
-  }
-
-  const updated = await updateRoom(roomId, {
-    finalReadyUids: readyUids,
-    finalReadyCount: readyUids.length,
-  });
-
-  const seats = getSeatCount(updated);
-  const readyCount = updated.finalReadyCount || 0;
-
-  let autoClosed = false;
-  let finalResult = null;
-
-  // NEW: only close once *everyone* is done
-  if (seats > 0 && readyCount >= seats) {
-    try {
-      finalResult = await completeFinalSession(updated);
-      autoClosed = !!finalResult.ok;
-    } catch (e) {
-      console.error('[final/ready] auto-complete error', e);
-    }
+  const readyRes = await markFinalReady(roomId, uid);
+  if (!readyRes.ok) {
+    return res.status(400).json({ error: 'wrong_stage', stage: readyRes.stage });
   }
 
   return res.json({
     ok: true,
-    readyCount,
-    seats,
-    autoClosed,
-    stage: autoClosed ? 'CLOSED' : stage,
-    ...(finalResult && finalResult.ok ? { finalCompletedAt: finalResult.finalCompletedAt } : {}),
+    readyCount: readyRes.readyCount,
+    seats: readyRes.seats,
+    autoClosed: readyRes.autoClosed,
+    stage: readyRes.autoClosed ? 'CLOSED' : 'FINAL',
   });
 });
 
@@ -1316,8 +1704,7 @@ app.post('/codes/consume', requireAuth, async (req, res) => {
         new UpdateCommand({
           TableName: TABLES.codes,
           Key: { code: item.code },
-          UpdateExpression:
-            'SET consumed = :c, usedBy = :u, consumedAt = :t',
+          UpdateExpression: 'SET consumed = :c, usedBy = :u, consumedAt = :t',
           ExpressionAttributeValues: {
             ':c': true,
             ':u': req.user.uid || '(unknown)',
@@ -1355,6 +1742,7 @@ function hasIndex(dir) {
     return false;
   }
 }
+
 const distDir = WEB_DIST_DIR;
 const distHasIndex = hasIndex(distDir);
 
@@ -1385,9 +1773,7 @@ app.get('/', (_req, res) => {
   res.sendFile(indexPath, (err) => {
     if (err) {
       console.error('[static /] index error', err);
-      res
-        .status(404)
-        .send(`Error: index.html not found at '${indexPath}'`);
+      res.status(404).send(`Error: index.html not found at '${indexPath}'`);
     }
   });
 });
@@ -1400,9 +1786,7 @@ app.get('/app', (_req, res) => {
   res.sendFile(indexPath, (err) => {
     if (err) {
       console.error('[static /app] index error', err);
-      res
-        .status(404)
-        .send(`Error: index.html not found at '${indexPath}'`);
+      res.status(404).send(`Error: index.html not found at '${indexPath}'`);
     }
   });
 });
@@ -1413,9 +1797,7 @@ if (ENABLE_SPA && distHasIndex) {
     res.sendFile(indexPath, (err) => {
       if (err) {
         console.error('[static fallback /app/*] error', err);
-        res
-          .status(404)
-          .send(`Error: index.html not found at '${indexPath}'`);
+        res.status(404).send(`Error: index.html not found at '${indexPath}'`);
       }
     });
   });
@@ -1438,9 +1820,7 @@ app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
 // ---------- 404 & Error handlers ----------
 app.use((req, res) =>
-  res
-    .status(404)
-    .json({ error: 'Not found', path: req.path, method: req.method })
+  res.status(404).json({ error: 'Not found', path: req.path, method: req.method })
 );
 
 app.use((err, _req, res, _next) => {
@@ -1452,15 +1832,9 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`API listening on 0.0.0.0:${PORT}`);
   console.log(`[env] region=${AWS_REGION}`);
+  console.log(`[env] endpoint=${AWS_DYNAMO_ENDPOINT || '(default)'}`);
   console.log(
-    `[env] endpoint=${AWS_DYNAMO_ENDPOINT || '(default)'}`
+    `[env] CORS_ORIGINS=${CORS_ORIGINS.length ? CORS_ORIGINS.join(',') : '(all)'}`
   );
-  console.log(
-    `[env] CORS_ORIGINS=${
-      CORS_ORIGINS.length ? CORS_ORIGINS.join(',') : '(all)'
-    }`
-  );
-  console.log(
-    `[env] SPA=${ENABLE_SPA} dist=${WEB_DIST_DIR} present=${distHasIndex}`
-  );
+  console.log(`[env] SPA=${ENABLE_SPA} dist=${WEB_DIST_DIR} present=${distHasIndex}`);
 });
