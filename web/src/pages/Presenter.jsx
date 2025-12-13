@@ -36,22 +36,41 @@ function useSiteIdFromUrl() {
   return [siteId, setSiteId];
 }
 
+/**
+ * Merge authHeaders() with presenter role header.
+ * This is the key fix so server.js isPresenterReq(req) passes.
+ */
+async function presenterAuthHeaders() {
+  const base = await authHeaders();
+
+  // authHeaders() should return { headers, credentials, ... }
+  // We merge headers safely.
+  const mergedHeaders = {
+    ...(base.headers || {}),
+    'x-user-role': 'PRESENTER',
+  };
+
+  return {
+    ...base,
+    headers: mergedHeaders,
+  };
+}
+
 export default function Presenter() {
   const [siteId, setSiteId] = useSiteIdFromUrl();
   const [rooms, setRooms] = useState([]);
-  const [gallery, setGallery] = useState([]);
-  const [galleryOpen, setGalleryOpen] = useState(false);
-
   const [loading, setLoading] = useState(false);
-  const [galleryLoading, setGalleryLoading] = useState(false);
   const [error, setError] = useState('');
-  const [galleryError, setGalleryError] = useState('');
 
   const canFetch = useMemo(() => !!(siteId && siteId.trim().length), [siteId]);
 
   // ── Auth bootstrap ──────────────────────────────────────────────────────
   useEffect(() => {
     ensureGuest().catch((e) => console.warn('[Presenter] ensureGuest failed', e));
+    // Ensure role is PRESENTER for this view (helps other parts of UI that read sessionStorage)
+    try {
+      sessionStorage.setItem('role', 'PRESENTER');
+    } catch {}
   }, []);
 
   // ── Fetch rooms list ────────────────────────────────────────────────────
@@ -64,7 +83,7 @@ export default function Presenter() {
       url.searchParams.set('siteId', siteId.toUpperCase());
 
       const res = await fetch(url.toString(), {
-        ...(await authHeaders()),
+        ...(await presenterAuthHeaders()),
       });
 
       if (!res.ok) {
@@ -84,39 +103,6 @@ export default function Presenter() {
     }
   }, [siteId, canFetch]);
 
-  // ── Fetch gallery (closed abstracts) ────────────────────────────────────
-  const loadGallery = useCallback(async () => {
-    if (!canFetch) return;
-    setGalleryLoading(true);
-    setGalleryError('');
-    try {
-      const url = new URL(`${API_BASE}/presenter/gallery`, window.location.origin);
-      url.searchParams.set('siteId', siteId.toUpperCase());
-
-      const res = await fetch(url.toString(), {
-        ...(await authHeaders()),
-      });
-
-      if (!res.ok) {
-        const j = await res.json().catch(() => ({}));
-        throw new Error(j.error || `gallery fetch failed (${res.status})`);
-      }
-
-      const j = await res.json();
-      const items = Array.isArray(j.items) ? j.items : [];
-
-      // normalize sort: newest first
-      items.sort((a, b) => (Number(b.closedAt || 0) || 0) - (Number(a.closedAt || 0) || 0));
-      setGallery(items);
-    } catch (err) {
-      console.error('[Presenter] gallery load error:', err);
-      setGallery([]);
-      setGalleryError(err.message || 'Could not load gallery.');
-    } finally {
-      setGalleryLoading(false);
-    }
-  }, [siteId, canFetch]);
-
   useEffect(() => {
     if (!canFetch) return;
     loadRooms();
@@ -124,20 +110,13 @@ export default function Presenter() {
     return () => clearInterval(id);
   }, [canFetch, loadRooms]);
 
-  // Load gallery when opened, then keep it fresh while open
-  useEffect(() => {
-    if (!canFetch || !galleryOpen) return;
-    loadGallery();
-    const id = setInterval(loadGallery, 5000);
-    return () => clearInterval(id);
-  }, [canFetch, galleryOpen, loadGallery]);
-
   // ── Simple POST helper for controls ─────────────────────────────────────
   async function post(path, body) {
     try {
+      const headers = await presenterAuthHeaders();
       const res = await fetch(`${API_BASE}${path}`, {
         method: 'POST',
-        ...(await authHeaders()),
+        ...headers,
         body: body ? JSON.stringify(body) : undefined,
       });
       if (!res.ok) {
@@ -161,7 +140,7 @@ export default function Presenter() {
   const startVote = (roomId) => post(`/rooms/${roomId}/vote/start`);
   const closeVote = (roomId) => post(`/rooms/${roomId}/vote/close`);
 
-  // NEW: presenter can close FINAL room (writes abstract + locks)
+  // NEW: close FINAL room from presenter dashboard
   const closeFinal = (roomId) => post(`/rooms/${roomId}/final/close`);
 
   // ── Derived summary for header ──────────────────────────────────────────
@@ -186,29 +165,13 @@ export default function Presenter() {
     [rooms]
   );
 
-  const closedCount = useMemo(
-    () => sortedRooms.filter((r) => (r.stage || '') === 'CLOSED').length,
-    [sortedRooms]
-  );
-
-  function formatWhen(ms) {
+  function formatClosedAt(ms) {
     const n = Number(ms || 0);
     if (!n) return '';
     try {
       return new Date(n).toLocaleString();
     } catch {
       return '';
-    }
-  }
-
-  async function copyToClipboard(text) {
-    try {
-      if (!text) return;
-      await navigator.clipboard.writeText(text);
-      alert('Copied to clipboard ✅');
-    } catch (e) {
-      console.warn('[Presenter] clipboard failed', e);
-      alert('Copy failed — your browser may block clipboard access.');
     }
   }
 
@@ -242,7 +205,8 @@ export default function Presenter() {
               Hotkeys on Room 1: <b>N</b> Next, <b>+</b> +2m, <b>R</b> Redo
             </div>
             <div>
-              Status: <span className="pill pill-live">{canFetch ? 'Live' : 'Idle'}</span>
+              Status:{' '}
+              <span className="pill pill-live">{canFetch ? 'Live' : 'Idle'}</span>
             </div>
             <div>
               Rooms: <b>{rooms.length}</b>
@@ -250,33 +214,6 @@ export default function Presenter() {
             <div>
               Participants: <b>{estimatedSeats}</b>
             </div>
-            <div>
-              Closed: <b>{closedCount}</b>
-            </div>
-          </div>
-
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
-            <button
-              type="button"
-              className={`btn ${galleryOpen ? 'primary' : ''}`}
-              onClick={() => setGalleryOpen((o) => !o)}
-              disabled={!canFetch}
-              title="Show all closed abstracts for this site"
-            >
-              {galleryOpen ? 'Hide Gallery' : 'Open Gallery'}
-            </button>
-            <button
-              type="button"
-              className="btn"
-              onClick={() => {
-                loadRooms();
-                if (galleryOpen) loadGallery();
-              }}
-              disabled={!canFetch}
-              title="Manual refresh"
-            >
-              Refresh
-            </button>
           </div>
         </header>
 
@@ -290,105 +227,6 @@ export default function Presenter() {
             </div>
           ))}
         </section>
-
-        {/* Gallery (closed abstracts) */}
-        {galleryOpen && (
-          <section className="presenter-gallery glass" style={{ marginTop: 12, padding: 12 }}>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
-              <div style={{ fontWeight: 800, fontSize: 14 }}>
-                🖼️ Site Gallery — closed abstracts ({gallery.length})
-              </div>
-              <div style={{ opacity: 0.7, fontSize: 12 }}>
-                Pulls from <code>/presenter/gallery</code> (gallery table if present, else room
-                fallback).
-              </div>
-              <div style={{ marginLeft: 'auto' }}>
-                {galleryLoading ? (
-                  <span className="pill">Loading…</span>
-                ) : galleryError ? (
-                  <span className="pill warn">{galleryError}</span>
-                ) : (
-                  <span className="pill pill-live">Live</span>
-                )}
-              </div>
-            </div>
-
-            {gallery.length === 0 && !galleryLoading && !galleryError && (
-              <div style={{ marginTop: 10, opacity: 0.8 }}>
-                No closed abstracts yet for <b>{siteId}</b>.
-              </div>
-            )}
-
-            {gallery.length > 0 && (
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-                  gap: 10,
-                  marginTop: 10,
-                }}
-              >
-                {gallery.map((it) => (
-                  <div
-                    key={`${it.roomId}-${it.closedAt || ''}`}
-                    className="glass"
-                    style={{
-                      borderRadius: 14,
-                      padding: 12,
-                      border: '1px solid rgba(148,163,184,0.22)',
-                      background: 'rgba(15,23,42,0.6)',
-                    }}
-                  >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
-                      <div style={{ fontWeight: 800 }}>
-                        Room {String(it.roomId || '').split('-')[1] || it.index || '—'}
-                      </div>
-                      <div style={{ opacity: 0.75, fontSize: 12 }}>{formatWhen(it.closedAt)}</div>
-                    </div>
-                    <div style={{ marginTop: 6, fontSize: 12, opacity: 0.9 }}>
-                      <span style={{ opacity: 0.75 }}>Topic:</span> <b>{it.topic || '—'}</b>
-                    </div>
-                    <div
-                      style={{
-                        marginTop: 8,
-                        whiteSpace: 'pre-wrap',
-                        lineHeight: 1.35,
-                        fontSize: 12,
-                        maxHeight: 200,
-                        overflowY: 'auto',
-                        padding: 10,
-                        borderRadius: 10,
-                        border: '1px solid rgba(148,163,184,0.18)',
-                        background: 'rgba(2,6,23,0.55)',
-                      }}
-                    >
-                      {it.abstract || '(no abstract saved)'}
-                    </div>
-                    <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                      <button
-                        type="button"
-                        className="btn"
-                        onClick={() => copyToClipboard(it.abstract || '')}
-                        disabled={!it.abstract}
-                      >
-                        Copy Abstract
-                      </button>
-                      <a
-                        className="btn"
-                        href={`/room/${it.roomId}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        title="Open live room transcript view"
-                      >
-                        Open Room
-                      </a>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-        )}
 
         {/* Error / empty */}
         {error && <div className="presenter-empty glass">{error}</div>}
@@ -404,13 +242,8 @@ export default function Presenter() {
         {/* Rooms grid */}
         <main className="rooms-grid">
           {sortedRooms.map((r) => {
-            const stageNow = r.stage || 'LOBBY';
-            const isClosed = stageNow === 'CLOSED';
-            const inFinal = stageNow === 'FINAL';
-
-            const topic = r.topic || '—';
-            const draftV = Number(r.draftVersion || 0);
-            const hasFinal = (r.finalAbstract || '').trim().length > 0;
+            const isClosed = (r.stage || '') === 'CLOSED';
+            const isFinal = (r.stage || '') === 'FINAL';
 
             return (
               <article key={r.id} className="room-card glass">
@@ -420,18 +253,16 @@ export default function Presenter() {
                       Room {r.index} {siteId}
                     </div>
                     <div className="room-card-sub">
-                      {stageNow === 'LOBBY'
+                      {r.stage === 'LOBBY'
                         ? 'Waiting for participants.'
                         : isClosed
                         ? 'Session complete — abstract ready.'
-                        : inFinal
-                        ? 'Final stage — closing soon.'
                         : 'Stage in progress.'}
                     </div>
                   </div>
 
                   <div className="room-card-stage">
-                    <span className="pill pill-stage">{stageNow}</span>
+                    <span className="pill pill-stage">{r.stage || '—'}</span>
                     <span className={`pill pill-status ${isClosed ? 'pill-closed' : ''}`}>
                       {isClosed ? 'CLOSED' : 'OPEN'}
                     </span>
@@ -445,53 +276,23 @@ export default function Presenter() {
                   <div>
                     <span className="label">Locked</span> {r.inputLocked ? 'Yes' : 'No'}
                   </div>
+                  <div className="room-card-topic">
+                    <span className="label">Topic</span> {r.topic || '—'}
+                  </div>
+
+                  {/* NEW (light touch): draft + closure metadata */}
                   <div>
                     <span className="label">Draft</span>{' '}
-                    {draftV ? `v${draftV}` : '—'}
+                    {Number(r.draftVersion || 0) ? `v${Number(r.draftVersion || 0)}` : '—'}
                   </div>
-                  <div className="room-card-topic">
-                    <span className="label">Topic</span> {topic}
-                  </div>
+                  {isClosed && (
+                    <div>
+                      <span className="label">Closed</span>{' '}
+                      {formatClosedAt(r.closedAt) || '—'}
+                      {r.closedReason ? ` (${r.closedReason})` : ''}
+                    </div>
+                  )}
                 </section>
-
-                {/* Final preview (if closed or saved) */}
-                {(isClosed || hasFinal) && (
-                  <section
-                    className="room-card-final"
-                    style={{
-                      marginTop: 10,
-                      borderRadius: 12,
-                      padding: 10,
-                      background: 'rgba(2,6,23,0.45)',
-                      border: '1px solid rgba(148,163,184,0.18)',
-                    }}
-                  >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
-                      <div style={{ fontWeight: 800, fontSize: 13 }}>🏁 Final Abstract</div>
-                      <button
-                        type="button"
-                        className="btn"
-                        onClick={() => copyToClipboard(r.finalAbstract || '')}
-                        disabled={!r.finalAbstract}
-                        style={{ padding: '6px 10px', fontSize: 12 }}
-                      >
-                        Copy
-                      </button>
-                    </div>
-                    <div
-                      style={{
-                        marginTop: 8,
-                        whiteSpace: 'pre-wrap',
-                        lineHeight: 1.35,
-                        fontSize: 12,
-                        maxHeight: 160,
-                        overflowY: 'auto',
-                      }}
-                    >
-                      {r.finalAbstract ? r.finalAbstract : '(no final abstract saved)'}
-                    </div>
-                  </section>
-                )}
 
                 {r.vote && (
                   <section className="room-card-vote">
@@ -518,41 +319,37 @@ export default function Presenter() {
 
                 <section className="room-card-controls">
                   <div className="room-card-row">
-                    <button type="button" onClick={() => next(r.id)} disabled={isClosed}>
+                    <button type="button" onClick={() => next(r.id)}>
                       Next
                     </button>
-                    <button type="button" onClick={() => extend(r.id, 120)} disabled={isClosed}>
+                    <button type="button" onClick={() => extend(r.id, 120)}>
                       +2m
                     </button>
-                    <button type="button" onClick={() => redo(r.id)} disabled={isClosed}>
+                    <button type="button" onClick={() => redo(r.id)}>
                       Redo
                     </button>
-                    <button type="button" onClick={() => lock(r.id)} className="warn" disabled={isClosed}>
+                    <button type="button" onClick={() => lock(r.id)} className="warn">
                       Lock
                     </button>
-                    <button type="button" onClick={() => unlock(r.id)} className="safe" disabled={isClosed}>
+                    <button type="button" onClick={() => unlock(r.id)} className="safe">
                       Unlock
                     </button>
                   </div>
 
                   <div className="room-card-row">
-                    <button type="button" onClick={() => startVote(r.id)} disabled={isClosed}>
+                    <button type="button" onClick={() => startVote(r.id)}>
                       Start Voting
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => closeVote(r.id)}
-                      className="warn"
-                      disabled={isClosed}
-                    >
+                    <button type="button" onClick={() => closeVote(r.id)} className="warn">
                       Close &amp; Lock Topic
                     </button>
 
+                    {/* NEW: presenter close FINAL (only enabled in FINAL) */}
                     <button
                       type="button"
                       onClick={() => closeFinal(r.id)}
                       className="warn"
-                      disabled={!inFinal || isClosed}
+                      disabled={!isFinal || isClosed}
                       title="FINAL stage only — posts final abstract and locks the room"
                     >
                       Close Room
@@ -569,6 +366,7 @@ export default function Presenter() {
                   </div>
                 </section>
 
+                {/* Optional inline presenter voting panel */}
                 <section className="room-card-voting-panel">
                   <PresenterVotingPanel roomId={r.id} isPresenter />
                 </section>
