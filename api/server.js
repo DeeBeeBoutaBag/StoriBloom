@@ -992,7 +992,7 @@ app.get('/presenter/rooms', requireAuth, requirePresenter, async (req, res) => {
       closedAt: r.closedAt || null,
       closedReason: r.closedReason || null,
     });
-    stageEngine.touch(id);
+
   }
   res.json({ rooms: out });
 });
