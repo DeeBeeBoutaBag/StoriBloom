@@ -1,9 +1,17 @@
 // web/src/components/PresenterVotingPanel.jsx
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import { useRoomVoting } from '../hooks/useRoomVoting.js';
 
-export default function PresenterVotingPanel({ roomId, isPresenter }) {
+export default function PresenterVotingPanel({
+  roomId,
+  isPresenter,
+  refreshKey = 0,
+}) {
   const { status, loading, startVoting, closeVoting, refresh } = useRoomVoting(roomId);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh, refreshKey]);
 
   // Normalize options to { label, num? } for display
   const options = useMemo(() => {

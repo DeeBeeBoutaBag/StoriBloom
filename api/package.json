@@ -8,7 +8,9 @@
   },
   "scripts": {
     "start": "NODE_ENV=production node server.js",
-  "dev": "NODE_ENV=development node server.js"
+    "dev": "NODE_ENV=development node server.js",
+    "lint": "node --check server.js && node --check asemaPersona.js && node --check openaiClient.js && node --check stageEngine.js && node --check auth.js && node --check authz.js",
+    "test": "node --test ./tests/*.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.922.0",

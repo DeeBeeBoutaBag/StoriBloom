@@ -13,15 +13,30 @@
     "dev:api": "npm --workspace api run dev",
     "dev:web": "npm --workspace web run dev",
     "dev": "npm run dev:api & npm run dev:web",
-
+    "lint:api": "npm --workspace api run lint",
+    "lint:web": "npm --workspace web run lint",
+    "lint": "npm run lint:api && npm run lint:web",
+    "test:api": "npm --workspace api run test",
+    "test:web": "npm --workspace web run test",
+    "test": "npm run test:api && npm run test:web",
     "build:web": "npm --workspace web run build",
     "build": "npm run build:web",
-
+    "ci": "npm run lint && npm run test && npm run build",
     "start:api": "npm --workspace api run start",
-
     "//": "---- Render convenience scripts (optional; set these as service commands on Render) ----",
     "render:build:web": "npm ci --workspace web && npm run build --workspace web",
     "render:build:api": "npm ci --workspace api",
-    "render:start:api": "npm run start --workspace api"
+    "render:start:api": "npm run start --workspace api",
+    "ddb:plan": "node scripts/ensureDynamoTables.mjs --dry-run",
+    "ddb:apply": "node scripts/ensureDynamoTables.mjs --apply",
+    "tenant:backfill:plan": "node scripts/backfillTenantIds.mjs",
+    "tenant:backfill:apply": "node scripts/backfillTenantIds.mjs --apply",
+    "tenant:purge:plan": "node scripts/purgeOrgData.mjs --orgId=ORG-REPLACE",
+    "tenant:purge:apply": "node scripts/purgeOrgData.mjs --orgId=ORG-REPLACE --apply=true",
+    "reliability:backup": "node scripts/backupDynamo.mjs",
+    "reliability:restore-drill": "node scripts/restoreDynamo.mjs"
+  },
+  "devDependencies": {
+    "baseline-browser-mapping": "^2.10.8"
   }
 }

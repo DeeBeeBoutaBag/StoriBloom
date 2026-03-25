@@ -60,7 +60,7 @@ export default function CountdownRing({ secondsLeft = 0, secondsTotal = 1 }) {
           cx="21"
           cy="21"
           r={radius}
-          stroke="rgba(255,255,255,0.15)"
+          stroke="rgba(106,84,53,0.24)"
           strokeWidth={stroke}
           fill="none"
         />
@@ -86,7 +86,7 @@ export default function CountdownRing({ secondsLeft = 0, secondsTotal = 1 }) {
           position: 'absolute',
           fontSize: 11,
           fontWeight: 600,
-          color: '#fff',
+          color: 'var(--ink-soft)',
           userSelect: 'none',
           letterSpacing: 0.4,
         }}

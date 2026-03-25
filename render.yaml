@@ -19,8 +19,80 @@ services:
           property: host # optional; you can paste manually later
       - key: OPENAI_API_KEY
         sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: SUPER_ADMIN_EMAIL
+        value: demetrious@hiddengeniusproject.org
       - key: OPENAI_MODEL
         value: gpt-4o-mini
+      - key: DDB_TABLE_WORKSHOPS
+        value: storibloom_workshops
+      - key: DDB_TABLE_SESSIONS
+        value: storibloom_sessions
+      - key: DDB_TABLE_AUTH_SESSIONS
+        value: storibloom_auth_sessions
+      - key: DDB_TABLE_GALLERY
+        value: storibloom_gallery
+      - key: DDB_TABLE_AUDIT
+        value: storibloom_audit
+      - key: DDB_TABLE_ORGS
+        value: storibloom_orgs
+      - key: DDB_TABLE_ORG_USERS
+        value: storibloom_org_users
+      - key: DDB_TABLE_LICENSES
+        value: storibloom_licenses
+      - key: DDB_TABLE_FEATURE_FLAGS
+        value: storibloom_feature_flags
+      - key: DDB_TABLE_POLICIES
+        value: storibloom_policies
+      - key: DDB_TABLE_TEMPLATES
+        value: storibloom_templates
+      - key: DDB_TABLE_APPROVALS
+        value: storibloom_approvals
+      - key: DDB_TABLE_BILLING
+        value: storibloom_billing
+      - key: DDB_TABLE_SUPPORT
+        value: storibloom_support
+      - key: DDB_TABLE_STATUS
+        value: storibloom_status
+      - key: MESSAGE_RETENTION_DAYS
+        value: 90
+      - key: DRAFT_RETENTION_DAYS
+        value: 365
+      - key: CODE_TTL_DAYS
+        value: 30
+      - key: CODE_HASH_SECRET
+        sync: false
+      - key: SESSION_TTL_HOURS
+        value: 24
+      - key: ACCESS_TOKEN_TTL_SECONDS
+        value: 900
+      - key: REFRESH_TOKEN_TTL_SECONDS
+        value: 2592000
+      - key: LICENSE_ACTIVE_USER_WINDOW_MS
+        value: 300000
+      - key: SUPER_ADMIN_ACTIVE_WINDOW_MS
+        value: 300000
+      - key: SCIM_BEARER_TOKEN
+        sync: false
+      - key: BILLING_PROVIDER
+        value: enterprise
+      - key: BILLING_ENTERPRISE_INVOICE_ENDPOINT
+        sync: false
+      - key: BILLING_STRIPE_INVOICE_ENDPOINT
+        value: https://api.stripe.com/v1/invoices
+      - key: BILLING_API_KEY
+        sync: false
+      - key: SUPPORT_ESCALATION_EMAIL
+        value: support@storibloom.app
+      - key: STATUS_PAGE_URL
+        value: /status
+      - key: SSO_DOMAIN_ALLOWLIST
+        value: hiddengeniusproject.org
+      - key: SSO_GROUP_ROLE_MAP
+        sync: false
+      - key: SSO_JIT_PROVISION
+        value: "1"
       - key: FIREBASE_PROJECT_ID
         sync: false
       - key: FIREBASE_SERVICE_ACCOUNT_BASE64
@@ -36,10 +108,9 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: VITE_API_URL
+      - key: VITE_API_BASE
         # After the API service is created, paste its URL (https://storibloom-api.onrender.com)
         fromService:
           type: web
           name: storibloom-api
           property: host # optional; you can paste manually later
-

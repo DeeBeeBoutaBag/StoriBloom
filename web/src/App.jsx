@@ -1,11 +1,15 @@
 // web/App.jsx
 import React, { useEffect, useState } from 'react';
-import { Outlet } from 'react-router-dom';
-
-const API_BASE = import.meta.env.VITE_API_BASE || '/api';
+import { Outlet, useLocation } from 'react-router-dom';
+import { AnimatePresence, motion } from 'framer-motion';
+import { API_BASE } from './api.js';
+import CommandPalette from './components/CommandPalette.jsx';
+import AccessibilityPanel from './components/AccessibilityPanel.jsx';
 
 export default function App() {
   const [health, setHealth] = useState(null);
+  const [trustInfo, setTrustInfo] = useState(null);
+  const location = useLocation();
 
   // simple health check on mount to confirm API connectivity
   useEffect(() => {
@@ -18,32 +22,103 @@ export default function App() {
       });
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    async function loadTrust() {
+      try {
+        const res = await fetch(`${API_BASE}/trust-center`);
+        if (res.ok) {
+          const json = await res.json().catch(() => ({}));
+          if (active) {
+            setTrustInfo({
+              status: json.status || 'UNKNOWN',
+              dataUsage: json?.security?.dataUsage || 'NO_TRAINING',
+              supportEscalationEmail:
+                json.supportEscalationEmail || 'support@storibloom.app',
+            });
+          }
+          return;
+        }
+      } catch {}
+      if (active) {
+        setTrustInfo({
+          status: 'UNKNOWN',
+          dataUsage: 'NO_TRAINING',
+          supportEscalationEmail: 'support@storibloom.app',
+        });
+      }
+    }
+    loadTrust();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const immersivePath =
+    location.pathname.startsWith('/room/') ||
+    location.pathname.startsWith('/presenter') ||
+    location.pathname.startsWith('/admin') ||
+    location.pathname.startsWith('/super-admin') ||
+    location.pathname.startsWith('/status') ||
+    location.pathname.startsWith('/trust-center') ||
+    location.pathname.startsWith('/shared/');
+
+  const routedView = (
+    <AnimatePresence mode="wait">
+      <motion.div
+        key={location.pathname}
+        className="page-reveal"
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={{ opacity: 0, y: -8 }}
+        transition={{ duration: 0.22, ease: 'easeOut' }}
+      >
+        <Outlet />
+      </motion.div>
+    </AnimatePresence>
+  );
+
+  const trustFloating = (
+    <a href="/trust-center" className="trust-floating" title="Open trust center">
+      <span>System: <b>{trustInfo?.status || (health?.ok ? 'OPERATIONAL' : 'UNKNOWN')}</b></span>
+      <span>Data: <b>{trustInfo?.dataUsage || 'NO_TRAINING'}</b></span>
+      <span>Support: <b>{trustInfo?.supportEscalationEmail || 'support@storibloom.app'}</b></span>
+    </a>
+  );
+
+  if (immersivePath) {
+    return (
+      <>
+        <CommandPalette />
+        <AccessibilityPanel />
+        {trustFloating}
+        {routedView}
+      </>
+    );
+  }
+
   return (
-    <div style={{ maxWidth: 960, margin: '0 auto', padding: 16, fontFamily: 'system-ui, sans-serif' }}>
-      <h1 style={{ textAlign: 'center', marginBottom: 24 }}>AsemaCollab Lite</h1>
+    <>
+      <CommandPalette />
+      <AccessibilityPanel />
+      {trustFloating}
+      <div className="app-shell">
+        <h1 className="app-title">StoriBloom Collaboration Suite</h1>
 
-      {/* Show quick API status */}
-      {health ? (
-        <div
-          style={{
-            background: health.ok ? '#d1fae5' : '#fee2e2',
-            color: health.ok ? '#065f46' : '#991b1b',
-            borderRadius: 8,
-            padding: '8px 12px',
-            marginBottom: 24,
-            fontSize: 14,
-          }}
-        >
-          {health.ok
-            ? `✅ API connected (region: ${health.region})`
-            : `❌ API unreachable — check console`}
-        </div>
-      ) : (
-        <p style={{ color: '#6b7280', fontSize: 14 }}>Checking API health...</p>
-      )}
+        {/* Show quick API status */}
+        {health ? (
+          <div className={`app-health ${health.ok ? 'app-health-ok' : 'app-health-error'}`}>
+            {health.ok
+              ? `API connected (region: ${health.region})`
+              : 'API unreachable - check server logs'}
+          </div>
+        ) : (
+          <p className="app-health-pending">Checking API health...</p>
+        )}
 
-      {/* Nested routes */}
-      <Outlet />
-    </div>
+        {/* Nested routes */}
+        {routedView}
+      </div>
+    </>
   );
 }

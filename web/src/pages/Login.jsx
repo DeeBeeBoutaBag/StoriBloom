@@ -2,7 +2,7 @@
 import React, { useState, useRef } from 'react';
 import { motion, useMotionValue, useTransform } from 'framer-motion';
 import EmojiDrawer from '../components/EmojiDrawer.jsx';
-import { ensureGuest, authHeaders, API_BASE } from '../api';
+import { ensureGuest, authHeaders, API_BASE, setAuthSession } from '../api';
 
 export default function Login() {
   const [code, setCode] = useState('');
@@ -61,11 +61,24 @@ export default function Login() {
 
       const role = json.role || 'PARTICIPANT';
       const siteId = json.siteId || 'E1';
-      sessionStorage.setItem('role', role);
+      setAuthSession({
+        token: json.token,
+        userId: json.userId || sessionStorage.getItem('userId'),
+        role,
+        licenseId: json.licenseId || '',
+        siteId,
+      });
 
       if (role === 'PRESENTER') {
+        sessionStorage.setItem('presenter_siteId', siteId);
         // Presenter HUD
         window.location.href = '/presenter';
+        return;
+      }
+
+      if (role === 'ADMIN') {
+        sessionStorage.setItem('licenseId', json.licenseId || siteId);
+        window.location.href = '/admin';
         return;
       }
 
@@ -74,23 +87,29 @@ export default function Login() {
       sessionStorage.setItem('personas', JSON.stringify(personas));
       sessionStorage.setItem('mode', mode);
 
-      // Ask API to assign a room (max 6 per room, rolls across rooms)
-      let roomId = `${siteId}-1`;
-      try {
-        const assignRes = await fetch(`${API_BASE}/rooms/assign`, {
-          method: 'POST',
-          ...(await authHeaders()),
-          body: JSON.stringify({ siteId }),
-        });
-        const assignJson = await assignRes.json().catch(() => ({}));
-        if (assignRes.ok && assignJson.roomId) {
-          roomId = assignJson.roomId;
+      // Participant access requires seat membership; only redirect after a successful assignment.
+      const assignRes = await fetch(`${API_BASE}/rooms/assign`, {
+        method: 'POST',
+        ...(await authHeaders()),
+        body: JSON.stringify({ siteId }),
+      });
+      const assignJson = await assignRes.json().catch(() => ({}));
+      if (!assignRes.ok || !assignJson.roomId) {
+        const reason = String(assignJson.error || '').trim();
+        if (reason === 'license_seat_cap_reached') {
+          alert('All licensed seats are currently full. Ask your admin to increase seat capacity.');
+        } else if (reason === 'license_active_user_cap_reached') {
+          alert('The active user limit is currently reached. Please try again in a moment.');
+        } else if (reason === 'site_forbidden' || reason === 'tenant_site_mismatch') {
+          alert('This code is not allowed for the selected site. Please use the correct facilitator code.');
+        } else {
+          alert('Could not assign you to a room. Please retry, or ask your facilitator for support.');
         }
-      } catch (e) {
-        console.warn('[login] /rooms/assign failed, falling back to first room', e);
+        setBusy(false);
+        return;
       }
 
-      window.location.href = `/room/${roomId}`;
+      window.location.href = `/room/${assignJson.roomId}`;
     } catch (e) {
       console.error(e);
       alert('Could not reach API. Check your API_BASE and CORS.');
@@ -109,11 +128,11 @@ export default function Login() {
       <div className="site-header">
         <div className="site-header-left">
           <span className="site-logo">🌸</span>
-          <span className="site-title">Asema Academy</span>
+          <span className="site-title">StoriBloom</span>
         </div>
         <div className="site-header-right">
           <span className="site-tagline">
-            Unmasking AI — one story at a time.
+            Team workshops powered by guided AI collaboration.
           </span>
         </div>
       </div>
@@ -135,36 +154,23 @@ export default function Login() {
             <div className="brand-badge tilt-raise-sm">
               SESSION ACCESS
             </div>
-            <div className="brand-title tilt-raise">
+            <div className="brand-title brand-title-login tilt-raise">
               StoriBloom.AI
             </div>
           </div>
           <div className="brand-sub tilt-raise-sm">
-            Live AI collaboration for your site. Enter the session
-            code from your facilitator to join your group.
+            Enter the code from your facilitator to join your workshop room.
+            You will participate anonymously with your emoji identity.
           </div>
 
           <div className="mt16">
-            <label
-              style={{
-                fontSize: 12,
-                color: '#b9bec6',
-              }}
-            >
+            <label className="login-field-label">
               SESSION CODE
-              <span
-                style={{
-                  fontSize: 11,
-                  color: '#9aa0a6',
-                  marginLeft: 6,
-                }}
-              >
-                (On your handout or screen)
-              </span>
+              <span className="login-field-hint">(from your facilitator)</span>
             </label>
             <input
               className="input mt6"
-              placeholder="U-TEST1 or P-1234"
+              placeholder="Example: U-TEST1 or P-1234"
               value={code}
               onChange={(e) => setCode(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && submit()}
@@ -187,25 +193,19 @@ export default function Login() {
             >
               Pair
             </button>
-            <div
-              style={{
-                marginLeft: 'auto',
-                fontSize: 12,
-                color: '#9aa0a6',
-              }}
-            >
-              You’ll appear anonymous, identified by
-              your emoji only.
+            <div className="login-inline-note">
+              You will appear anonymously using your emoji only.
             </div>
           </div>
 
+          <div className="mt12 login-portal-note">
+            Need setup access? Go to{' '}
+            <a href="/admin" className="login-inline-link">/admin</a>. Platform operations:{' '}
+            <a href="/super-admin" className="login-inline-link">/super-admin</a>.
+          </div>
+
           <div className="mt16">
-            <label
-              style={{
-                fontSize: 12,
-                color: '#b9bec6',
-              }}
-            >
+            <label className="login-field-label">
               EMOJI PERSONA
               {mode === 'pair' ? 'S' : ''}
             </label>
@@ -255,30 +255,17 @@ export default function Login() {
             >
               {busy ? 'Entering…' : 'Enter Session'}
             </button>
-            <div
-              style={{
-                marginLeft: 'auto',
-                fontSize: 12,
-                color: '#b9bec6',
-              }}
-            >
-              Tip: press{' '}
-              <span style={{ color: 'var(--gold)' }}>
+            <div className="login-inline-tip">
+              Quick tip: press{' '}
+              <span className="login-tip-key">
                 Enter
               </span>{' '}
-              to submit.
+              to continue.
             </div>
           </div>
 
-          <div
-            className="mt12"
-            style={{
-              fontSize: 11,
-              color: '#7b818a',
-            }}
-          >
-            Proceeding implies acceptance of session
-            guidelines. Unauthorized access will be logged.
+          <div className="mt12 login-legal-note">
+            By continuing, you agree to workshop guidelines. Access activity may be logged for security.
           </div>
         </motion.div>
 
@@ -289,8 +276,7 @@ export default function Login() {
             <div className="step-body">
               <div className="step-title">Enter your code</div>
               <div className="step-text">
-                Use the session code your facilitator shared for your
-                site and time slot.
+                Use the workshop code shared by your facilitator.
               </div>
             </div>
           </div>
@@ -299,7 +285,7 @@ export default function Login() {
             <div className="step-body">
               <div className="step-title">Choose your emoji</div>
               <div className="step-text">
-                Your emoji is your identity. No names, just vibes and ideas.
+                Your emoji is your anonymous identity in the room.
               </div>
             </div>
           </div>
@@ -308,8 +294,7 @@ export default function Login() {
             <div className="step-body">
               <div className="step-title">Build with Asema</div>
               <div className="step-text">
-                Join your group room and co-create a story or abstract
-                with AI as your collaborator.
+                Collaborate with your group and the AI guide through each phase.
               </div>
             </div>
           </div>

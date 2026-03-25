@@ -6,7 +6,9 @@
   },
   "roomsPerSite": 5,
   "participantCodesPerSite": 50,
+  "adminCodesPerSite": 1,
   "codePrefixes": {
+    "admin": "A-",
     "presenter": "P-",
     "participant": "U-"
   },

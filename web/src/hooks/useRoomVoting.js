@@ -18,7 +18,6 @@ export function useRoomVoting(roomId) {
     counts: [],
   });
   const [loading, setLoading] = useState(false);
-  const pollRef = useRef(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -125,9 +124,9 @@ export function useRoomVoting(roomId) {
     }
   }, [roomId, fetchStatus]);
 
-  // Polling lifecycle
+  // Fetch lifecycle
   useEffect(() => {
-    // If no roomId, stop polling and reset status to a safe default
+    // If no roomId, reset status to a safe default
     if (!roomId) {
       setStatus({
         votingOpen: false,
@@ -135,28 +134,11 @@ export function useRoomVoting(roomId) {
         votesReceived: 0,
         counts: [],
       });
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
       return;
     }
 
     // Initial fetch
     fetchStatus();
-
-    // Start polling
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-    }
-    pollRef.current = setInterval(fetchStatus, 2000);
-
-    return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
-    };
   }, [roomId, fetchStatus]);
 
   return {

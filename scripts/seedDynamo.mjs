@@ -3,6 +3,7 @@
  * Seed DynamoDB with Sites, Rooms, and Codes for StoriBloom.AI
  * - 9 sites: 4 East (E1..E4), 1 Central (C1), 4 West (W1..W4)
  * - 5 rooms per site: <SITE>-1 ... <SITE>-5
+ * - 1 admin code per site/license: A-xxxxxxxx
  * - 1 presenter code per site: P-xxxxxxxx
  * - 50 participant codes per site: U-xxxxxxxx
  *
@@ -136,11 +137,22 @@ async function seedRooms(siteId) {
 }
 
 async function seedCodes(siteId, presenterCode) {
-  // 1 presenter code (already generated in SITE)
+  const adminCode = code("A");
+  // 1 admin code + 1 presenter code
   const codes = [
+    {
+      code: adminCode,
+      siteId,
+      siteIds: [siteId],
+      licenseId: siteId,
+      role: "ADMIN",
+      consumed: false,
+      createdAt: nowMs(),
+    },
     {
       code: presenterCode,
       siteId,
+      licenseId: siteId,
       role: "PRESENTER",
       consumed: false,
       createdAt: nowMs(),
@@ -151,13 +163,14 @@ async function seedCodes(siteId, presenterCode) {
     codes.push({
       code: code("U"),
       siteId,
+      licenseId: siteId,
       role: "PARTICIPANT",
       consumed: false,
       createdAt: nowMs(),
     });
   }
   await batchWrite(T.codes, codes);
-  return codes;
+  return { codes, adminCode };
 }
 
 function pad(n) {
@@ -187,11 +200,12 @@ async function main() {
     const presenterCode = code("P");
     const site = await putSite(siteId, presenterCode);
     const rooms = await seedRooms(siteId);
-    const codes = await seedCodes(siteId, presenterCode);
+    const { codes, adminCode } = await seedCodes(siteId, presenterCode);
 
     summary.push({
       siteId,
       wave: site.wave,
+      adminCode,
       presenterCode,
       roomsCount: rooms.length,
       participantCodes: codes.filter((c) => c.role === "PARTICIPANT").length,
@@ -219,7 +233,7 @@ async function main() {
   // Master CSVs
   fs.writeFileSync(
     path.join(outDir, `sites.csv`),
-    toCSV(summary, ["siteId", "wave", "presenterCode", "roomsCount", "participantCodes"]),
+    toCSV(summary, ["siteId", "wave", "adminCode", "presenterCode", "roomsCount", "participantCodes"]),
     "utf8"
   );
 

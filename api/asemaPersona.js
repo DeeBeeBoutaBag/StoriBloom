@@ -110,9 +110,79 @@ export function stageInstructionText(stage) {
 
 // ===== Persona Prompts =====
 
-export function personaSystemPrompt({ roomTopic } = {}) {
+export function personaSystemPrompt({
+  roomTopic,
+  aiBehavior = 'GUIDE',
+  assistantPersona = '',
+  tone = 'BALANCED',
+  strictness = 'MEDIUM',
+  dataUsage = 'NO_TRAINING',
+  piiRedaction = true,
+  citationMode = false,
+  ageSafeMode = 'K12',
+  moderationLevel = 'STANDARD',
+  blockedTerms = [],
+} = {}) {
   const topicList = ISSUES.join(', ');
   const topic = normalizeTopic(roomTopic);
+  const behavior = String(aiBehavior || 'GUIDE')
+    .trim()
+    .toUpperCase();
+  const behaviorInstruction =
+    behavior === 'BACKGROUND'
+      ? 'Stay mostly in the background. Answer only when directly prompted, and keep replies concise.'
+      : behavior === 'HELPER'
+      ? 'Act as a hands-on helper. Offer concrete options and examples, but do not take over ownership from participants.'
+      : 'Act as an active guide. Keep the group focused, ask clarifying questions, and maintain momentum.';
+  const toneKey = String(tone || 'BALANCED').trim().toUpperCase();
+  const strictnessKey = String(strictness || 'MEDIUM').trim().toUpperCase();
+  const dataUsageKey = String(dataUsage || 'NO_TRAINING').trim().toUpperCase();
+  const toneInstruction =
+    toneKey === 'SOFT'
+      ? 'Tone: gentle and affirming, low-pressure.'
+      : toneKey === 'DIRECT'
+      ? 'Tone: direct, concise, and practical.'
+      : toneKey === 'COACH'
+      ? 'Tone: coaching style with concrete next-step prompts.'
+      : 'Tone: balanced warmth with practical clarity.';
+  const strictnessInstruction =
+    strictnessKey === 'HIGH'
+      ? 'Strictness: enforce concise, specific answers and redirect quickly when off-task.'
+      : strictnessKey === 'LOW'
+      ? 'Strictness: allow broader exploration before narrowing.'
+      : 'Strictness: keep a medium level of structure and focus.';
+  const dataUsageInstruction =
+    dataUsageKey === 'ANONYMIZED'
+      ? 'Data usage mode: avoid quoting personal identifiers; generalize examples.'
+      : dataUsageKey === 'ANALYTICS_ONLY'
+      ? 'Data usage mode: focus on aggregate patterns, avoid personal detail retention.'
+      : 'Data usage mode: do not include or retain unnecessary personal data.';
+  const citationInstruction = citationMode
+    ? 'When factual claims are made, encourage citing concrete sources.'
+    : 'Citations are optional unless participants request them.';
+  const ageSafeKey = String(ageSafeMode || 'K12').trim().toUpperCase();
+  const moderationKey = String(moderationLevel || 'STANDARD').trim().toUpperCase();
+  const ageSafeInstruction =
+    ageSafeKey === 'OFF'
+      ? 'Age-safe mode: disabled.'
+      : ageSafeKey === 'ADULT'
+      ? 'Age-safe mode: adult audience; still avoid explicit harm instructions.'
+      : ageSafeKey === 'TEEN'
+      ? 'Age-safe mode: teen audience; avoid explicit sexual or graphic violent content.'
+      : 'Age-safe mode: K-12 safe language only; no explicit sexual, graphic violent, or self-harm content.';
+  const moderationInstruction =
+    moderationKey === 'OFF'
+      ? 'Moderation: minimal filtering.'
+      : moderationKey === 'STRICT'
+      ? 'Moderation: strict safety filtering; proactively redirect unsafe language.'
+      : 'Moderation: standard safety filtering for harassment, self-harm, and violent intent.';
+  const blockedTermsList = Array.isArray(blockedTerms)
+    ? blockedTerms.map((term) => String(term || '').trim()).filter(Boolean).slice(0, 30)
+    : [];
+  const blockedTermsInstruction = blockedTermsList.length
+    ? `Organization blocked terms: ${blockedTermsList.join(', ')}. Do not repeat them; redirect constructively.`
+    : 'Organization blocked terms: none configured.';
+  const personaBrief = String(assistantPersona || '').trim();
   return `
 You are **Asema** — a modern, warm, witty Black woman in her early 30s, hosting a classy game-show style workshop.
 
@@ -132,8 +202,18 @@ Hard rules:
 - Stay on-task. If users go off-topic, gently redirect back to story work.
 - Avoid generic motivational speeches. Be specific and actionable.
 - In EDITING/FINAL: you are an editor. Make surgical changes. Do NOT generate an unrelated new draft.
+- AI facilitation style: ${behaviorInstruction}
+- ${toneInstruction}
+- ${strictnessInstruction}
+- ${dataUsageInstruction}
+- PII redaction: ${piiRedaction ? 'enabled' : 'disabled'}.
+- ${citationInstruction}
+- ${ageSafeInstruction}
+- ${moderationInstruction}
+- ${blockedTermsInstruction}
 
 Current topic (if any): ${topic || 'Not selected yet — guide them to pick one.'}
+${personaBrief ? `Custom facilitator brief: ${personaBrief}` : ''}
 `.trim();
 }
 
@@ -356,7 +436,10 @@ function isRetryableError(err) {
   return false;
 }
 
-async function callOpenAI(messages, { maxTokens = 450, temperature = 0.7 } = {}) {
+async function callOpenAI(
+  messages,
+  { maxTokens = 450, temperature = 0.7, modelChoice = MODEL } = {}
+) {
   const client = getOpenAI();
   const MAX_RETRIES = 3;
   const BASE_DELAY_MS = 250;
@@ -367,8 +450,9 @@ async function callOpenAI(messages, { maxTokens = 450, temperature = 0.7 } = {})
     try {
       await throttleOpenAI();
 
+      const resolvedModel = String(modelChoice || MODEL).trim() || MODEL;
       const res = await client.chat.completions.create({
-        model: MODEL,
+        model: resolvedModel,
         messages,
         max_tokens: maxTokens,
         temperature,
@@ -394,6 +478,14 @@ async function callOpenAI(messages, { maxTokens = 450, temperature = 0.7 } = {})
   }
 
   throw lastError || new Error('Asema OpenAI call failed');
+}
+
+function adjustedTemperature(baseTemperature, strictness) {
+  const base = Number(baseTemperature || 0.7);
+  const key = String(strictness || 'MEDIUM').trim().toUpperCase();
+  if (key === 'HIGH') return Math.max(0.1, base - 0.2);
+  if (key === 'LOW') return Math.min(0.95, base + 0.15);
+  return base;
 }
 
 // Small helper: detect "Asema AI this is our topic ..."
@@ -543,8 +635,8 @@ Data:
 export const Asema = {
   extractTopicFromUtterance,
 
-  async greet(stage, roomTopic) {
-    const sys = personaSystemPrompt({ roomTopic });
+  async greet(stage, roomTopic, options = {}) {
+    const sys = personaSystemPrompt({ roomTopic, ...options });
     const deterministic = stageGreeting(stage, { roomTopic });
 
     // We now force stage greetings to contain clear instructions.
@@ -567,15 +659,19 @@ ${deterministic}
           { role: 'system', content: sys },
           { role: 'user', content: prompt },
         ],
-        { maxTokens: 260, temperature: 0.6 }
+        {
+          maxTokens: 260,
+          temperature: adjustedTemperature(0.6, options?.strictness),
+          modelChoice: options?.modelChoice || MODEL,
+        }
       );
     } catch {
       return deterministic;
     }
   },
 
-  async replyToUser(stage, roomTopic, userText) {
-    const sys = personaSystemPrompt({ roomTopic });
+  async replyToUser(stage, roomTopic, userText, options = {}) {
+    const sys = personaSystemPrompt({ roomTopic, ...options });
     const text = String(userText || '').trim();
 
     const stageHint = (() => {
@@ -627,15 +723,22 @@ ${editorGuard}
           { role: 'system', content: instructions },
           { role: 'user', content: text },
         ],
-        { maxTokens: 350, temperature: stage === 'EDITING' || stage === 'FINAL' ? 0.45 : 0.7 }
+        {
+          maxTokens: 350,
+          temperature: adjustedTemperature(
+            stage === 'EDITING' || stage === 'FINAL' ? 0.45 : 0.7,
+            options?.strictness
+          ),
+          modelChoice: options?.modelChoice || MODEL,
+        }
       );
     } catch {
       return `Okay — make it one notch more concrete. Who is the protagonist, where are they, and what do they risk losing?`;
     }
   },
 
-  async summarizeIdeas(stage, roomTopic, ideaLines) {
-    const sys = personaSystemPrompt({ roomTopic });
+  async summarizeIdeas(stage, roomTopic, ideaLines, options = {}) {
+    const sys = personaSystemPrompt({ roomTopic, ...options });
     const text = (ideaLines || []).slice(-80).join('\n');
 
     const prompt = `
@@ -658,15 +761,19 @@ ${text}
           { role: 'system', content: sys },
           { role: 'user', content: prompt },
         ],
-        { maxTokens: 420, temperature: 0.55 }
+        {
+          maxTokens: 420,
+          temperature: adjustedTemperature(0.55, options?.strictness),
+          modelChoice: options?.modelChoice || MODEL,
+        }
       );
     } catch {
       return '• Capturing ideas… keep sharing specifics so I can lock in your strongest angle.';
     }
   },
 
-  async generateRoughDraft(topic, ideaSummary, roomId) {
-    const sys = personaSystemPrompt({ roomTopic: topic || '' });
+  async generateRoughDraft(topic, ideaSummary, roomId, options = {}) {
+    const sys = personaSystemPrompt({ roomTopic: topic || '', ...options });
 
     const prompt = `
 Using the notes below, write a **single ~250-word abstract** for a short story on "${
@@ -691,7 +798,11 @@ Return the abstract text now.
         { role: 'system', content: sys },
         { role: 'user', content: prompt },
       ],
-      { maxTokens: 650, temperature: 0.75 }
+      {
+        maxTokens: 650,
+        temperature: adjustedTemperature(0.75, options?.strictness),
+        modelChoice: options?.modelChoice || MODEL,
+      }
     );
 
     return out;
